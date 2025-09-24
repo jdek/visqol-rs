@@ -17,6 +17,15 @@ impl SupportVectorRegressionModel {
                 .expect("Failed to load SVM model"),
         }
     }
+
+    /// Creates a model from a string containing a description in LibSVM format.
+    pub fn from_model_content(model_description: &str) -> Self {
+        Self {
+            model: DenseSVM::try_from(model_description)
+                .expect("Failed to load SVM model"),
+        }
+    }
+
     /// Given a slice of features, this function produces a single score.
     pub fn predict(&self, observation: &[f64]) -> f64 {
         let mut problem = DenseFeatures::from(&self.model);

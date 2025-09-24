@@ -6,9 +6,12 @@ use std::error::Error;
 use visqol_rs::{
     constants::{NUM_BANDS_AUDIO, NUM_BANDS_SPEECH},
     similarity_result::SimilarityResult,
+    support_vector_regression_model::SupportVectorRegressionModel,
     variant::Variant,
     visqol_manager::VisqolManager,
 };
+
+const DEFAULT_MODEL_CONTENT: &str = include_str!("../../model/libsvm_nu_svr_model.txt");
 
 pub mod command_line_utils;
 pub mod output_utils;
@@ -59,9 +62,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         command_line_utils::Subcommands::Fullband {
             similarity_to_quality_model,
         } => {
-            variant = Variant::Fullband {
-                model_path: similarity_to_quality_model.clone(),
+            let svm_model = if let Some(path) = similarity_to_quality_model {
+                log::info!("Loading custom SVM model from: {}", path);
+                SupportVectorRegressionModel::new(path)
+            } else {
+                log::info!("Using embedded default SVM model.");
+                SupportVectorRegressionModel::from_model_content(DEFAULT_MODEL_CONTENT)
             };
+
+            variant = Variant::Fullband { model: svm_model };
             visqol_audio = VisqolManager::new(variant, args.search_window_radius);
             results = run(&files_to_compare, &mut visqol_audio)?;
         }

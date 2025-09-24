@@ -7,11 +7,9 @@ pub struct SvrSimilarityToQualityMapper {
 }
 
 impl SvrSimilarityToQualityMapper {
-    /// Initializes the model's weights with a libSVM formatted file located in `model_path`
-    pub fn new(model_path: &str) -> Self {
-        Self {
-            model: SupportVectorRegressionModel::new(model_path),
-        }
+    /// Initializes the mapper with a pre-constructed `SupportVectorRegressionModel`.
+    pub fn new(model: SupportVectorRegressionModel) -> Self {
+        Self { model }
     }
 }
 
