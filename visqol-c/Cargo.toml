@@ -1,0 +1,16 @@
+[package]
+name = "visqol-c"
+version = "0.1.0"
+edition = "2021"
+authors = ["Daniel Strübig"]
+license = "Apache-2.0"
+description = "C API bindings for visqol-rs"
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+visqol-rs = { path = "../visqol-rs" }
+
+[build-dependencies]
+cbindgen = "0.27"

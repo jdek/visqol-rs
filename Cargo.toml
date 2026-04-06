@@ -1,5 +1,5 @@
 [workspace]
-members = ["visqol-rs", "visqol"]
+members = ["visqol-rs", "visqol", "visqol-c"]
 resolver = "2"
 
 [profile.release]
