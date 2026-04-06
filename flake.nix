@@ -19,7 +19,7 @@
     ];
 
     packages = {
-      visqol-c = { naersk, defaultMeta, makePkgconfigItem, symlinkJoin, ... }:
+      visqol-c = { naersk, defaultMeta, makePkgconfigItem, symlinkJoin, stdenv, ... }:
         let
           clib = naersk.buildPackage {
             src = cargoSrc;
@@ -31,6 +31,8 @@
             postInstall = ''
               mkdir -p $out/include
               find target -name visqol.h -path '*/out/visqol.h' -exec cp {} $out/include/ \;
+            '' + lib.optionalString stdenv.hostPlatform.isDarwin ''
+              install_name_tool -id $out/lib/libvisqol_c.dylib $out/lib/libvisqol_c.dylib
             '';
           };
           pc = makePkgconfigItem {
