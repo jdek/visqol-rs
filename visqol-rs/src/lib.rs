@@ -1,3 +1,5 @@
+#![feature(portable_simd)]
+
 //! An implementation of the `Virtual Speech Quality Objective Listener(ViSQOL)` algorithm, an objective, full-reference metric for perceived audio quality.
 //!
 //! # Example

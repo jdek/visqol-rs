@@ -1,35 +1,42 @@
 use ndarray::{Array2, ShapeBuilder};
 
-/// Computes the convolution of `input_matrix` with `fir_filter`
+/// Computes the 2D convolution of `input_matrix` with `fir_filter`, using
+/// boundary reflection (replicate-padding). The output has the same dimensions
+/// as `input_matrix`.
+///
+/// This is a general implementation that falls through to a specialized 3×3
+/// fast-path when the filter is 3×3 (the only size used in ViSQOL).
 pub fn perform_valid_2d_conv_with_boundary(
     fir_filter: &Array2<f64>,
     input_matrix: &mut Array2<f64>,
 ) -> Array2<f64> {
-    let padded_matrix = add_matrix_boundary(input_matrix);
-    let padded_flattened_matrix = flatten_matrix(&padded_matrix);
+    let f_r = fir_filter.nrows();
+    let f_c = fir_filter.ncols();
 
+    if f_r == 3 && f_c == 3 {
+        return conv2d_3x3_reflected(fir_filter, input_matrix);
+    }
+
+    // Fallback: general case (kept for correctness, not on hot path)
+    let padded_matrix = add_matrix_boundary(input_matrix);
     let i_r_c = padded_matrix.nrows();
     let i_c_c = padded_matrix.ncols();
-    let f_r_c = fir_filter.nrows();
-    let f_c_c = fir_filter.ncols();
-    let o_r_c = i_r_c - f_r_c + 1;
-    let o_c_c = i_c_c - f_c_c + 1;
-    let filter_size = f_r_c * f_c_c;
-
-    let flattened_filter = flatten_matrix(fir_filter);
+    let o_r_c = i_r_c - f_r + 1;
+    let o_c_c = i_c_c - f_c + 1;
 
     let mut out_matrix = Array2::<f64>::zeros((o_r_c, o_c_c).f());
 
     for o_row in 0..o_r_c {
         for o_col in 0..o_c_c {
             let mut sum = 0.0f64;
-            let mut filter_index = filter_size - 1;
-
-            for f_col in 0..f_c_c {
-                for f_row in 0..f_r_c {
-                    let idx = ((f_row + o_row) * i_c_c) + f_col + o_col;
-                    sum += padded_flattened_matrix[idx] * flattened_filter[filter_index];
-                    filter_index = filter_index.saturating_sub(1);
+            for f_row in 0..f_r {
+                for f_col in 0..f_c {
+                    let ir = o_row + f_row;
+                    let ic = o_col + f_col;
+                    // Filter is applied in reverse order (correlation-style)
+                    let fr = f_r - 1 - f_row;
+                    let fc = f_c - 1 - f_col;
+                    sum += padded_matrix[(ir, ic)] * fir_filter[(fr, fc)];
                 }
             }
             out_matrix[(o_row, o_col)] = sum;
@@ -38,14 +45,102 @@ pub fn perform_valid_2d_conv_with_boundary(
     out_matrix
 }
 
-fn flatten_matrix(input_matrix: &Array2<f64>) -> Vec<f64> {
-    let mut res = Vec::<f64>::new();
-    for i in 0..input_matrix.nrows() {
-        for j in 0..input_matrix.ncols() {
-            res.push(input_matrix[(i, j)]);
+/// Specialized 3×3 convolution with replicate-boundary padding.
+/// Computes boundary reflections on-the-fly, avoiding all intermediate
+/// matrix allocations. Uses raw slice access for speed.
+#[inline(always)]
+fn conv2d_3x3_reflected(filter: &Array2<f64>, input: &Array2<f64>) -> Array2<f64> {
+    let nrows = input.nrows();
+    let ncols = input.ncols();
+
+    // Reversed filter weights (convolution = cross-correlation with flipped kernel)
+    let w00 = filter[(2, 2)];
+    let w01 = filter[(2, 1)];
+    let w02 = filter[(2, 0)];
+    let w10 = filter[(1, 2)];
+    let w11 = filter[(1, 1)];
+    let w12 = filter[(1, 0)];
+    let w20 = filter[(0, 2)];
+    let w21 = filter[(0, 1)];
+    let w22 = filter[(0, 0)];
+
+    // Ensure input is contiguous so we can use raw slice access.
+    // The output is created in standard (C) order for contiguous row access.
+    let input_c = if input.is_standard_layout() {
+        None
+    } else {
+        Some(input.as_standard_layout().into_owned())
+    };
+    let inp = input_c.as_ref().unwrap_or(input);
+    let inp_slice = inp.as_slice().expect("input not contiguous after layout fix");
+
+    let mut out = Array2::<f64>::zeros((nrows, ncols));
+    let out_slice = out.as_slice_mut().expect("output not contiguous");
+
+    // Row accessor: row r, col c => inp_slice[r * ncols + c]
+    // Handle boundaries: first/last row and first/last col
+    for r in 0..nrows {
+        let rm1 = if r == 0 { 0 } else { r - 1 };
+        let rp1 = if r + 1 >= nrows { nrows - 1 } else { r + 1 };
+
+        let row_m1 = rm1 * ncols;
+        let row_0 = r * ncols;
+        let row_p1 = rp1 * ncols;
+
+        // First column (c=0): cm1 = 0, cp1 = 1 (or 0 if ncols==1)
+        {
+            let c = 0;
+            let cm1 = 0;
+            let cp1 = if ncols > 1 { 1 } else { 0 };
+
+            out_slice[row_0 + c] = w00 * inp_slice[row_m1 + cm1]
+                + w01 * inp_slice[row_m1 + c]
+                + w02 * inp_slice[row_m1 + cp1]
+                + w10 * inp_slice[row_0 + cm1]
+                + w11 * inp_slice[row_0 + c]
+                + w12 * inp_slice[row_0 + cp1]
+                + w20 * inp_slice[row_p1 + cm1]
+                + w21 * inp_slice[row_p1 + c]
+                + w22 * inp_slice[row_p1 + cp1];
+        }
+
+        // Interior columns: no boundary checks needed
+        for c in 1..ncols.saturating_sub(1) {
+            let cm1 = c - 1;
+            let cp1 = c + 1;
+
+            out_slice[row_0 + c] = w00 * inp_slice[row_m1 + cm1]
+                + w01 * inp_slice[row_m1 + c]
+                + w02 * inp_slice[row_m1 + cp1]
+                + w10 * inp_slice[row_0 + cm1]
+                + w11 * inp_slice[row_0 + c]
+                + w12 * inp_slice[row_0 + cp1]
+                + w20 * inp_slice[row_p1 + cm1]
+                + w21 * inp_slice[row_p1 + c]
+                + w22 * inp_slice[row_p1 + cp1];
+        }
+
+        // Last column (if ncols > 1)
+        if ncols > 1 {
+            let c = ncols - 1;
+            let cm1 = c - 1;
+            let cp1 = c; // clamped
+
+            out_slice[row_0 + c] = w00 * inp_slice[row_m1 + cm1]
+                + w01 * inp_slice[row_m1 + c]
+                + w02 * inp_slice[row_m1 + cp1]
+                + w10 * inp_slice[row_0 + cm1]
+                + w11 * inp_slice[row_0 + c]
+                + w12 * inp_slice[row_0 + cp1]
+                + w20 * inp_slice[row_p1 + cm1]
+                + w21 * inp_slice[row_p1 + c]
+                + w22 * inp_slice[row_p1 + cp1];
         }
     }
-    res
+
+    // If the caller expects Fortran order, convert. But since NSIM
+    // immediately does element-wise ops, C order is fine.
+    out
 }
 
 /// Compute zero-padded matrix and fill zero-padded boundaries with the adjacent non-zero rows and columns

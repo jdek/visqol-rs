@@ -44,8 +44,8 @@ impl ComparisonPatchesSelector {
             return Err(VisqolError::SignalsTooDifferent);
         } else if num_patches < ref_patch_indices.len() {
             log::warn!(
-                "Warning: Dropping {} (of {}) reference patches 
-            due to the degraded file being misaligned or too short. If too many 
+                "Warning: Dropping {} (of {}) reference patches
+            due to the degraded file being misaligned or too short. If too many
             patches are dropped, the score will be less meaningful.",
                 ref_patch_indices.len() - num_patches,
                 ref_patch_indices.len()
@@ -60,14 +60,33 @@ impl ComparisonPatchesSelector {
             vec![vec![0.0f64; spectrogram_data.ncols()]; ref_patch_indices.len()];
         let mut backtrace = vec![vec![0usize; spectrogram_data.ncols()]; ref_patch_indices.len()];
 
+        // Only build deg patches within the search window range to avoid
+        // allocating patches for offsets that will never be visited.
+        let global_lower = if ref_patch_indices.is_empty() {
+            0
+        } else {
+            (ref_patch_indices[0] as i32 - search_window).max(0) as usize
+        };
+        let global_upper = if ref_patch_indices.is_empty() {
+            0
+        } else {
+            (*ref_patch_indices.last().unwrap() as i32 + search_window + 1)
+                .min(spectrogram_data.ncols() as i32) as usize
+        };
+
         let mut deg_patches = Vec::<Array2<f64>>::with_capacity(spectrogram_data.ncols());
 
         for slide_offset in 0..spectrogram_data.ncols() {
-            deg_patches.push(Self::build_degraded_patch(
-                spectrogram_data,
-                slide_offset,
-                slide_offset + ref_patches[0].ncols(),
-            ));
+            if slide_offset >= global_lower && slide_offset < global_upper {
+                deg_patches.push(Self::build_degraded_patch(
+                    spectrogram_data,
+                    slide_offset,
+                    slide_offset + ref_patches[0].ncols(),
+                ));
+            } else {
+                // Placeholder - won't be accessed
+                deg_patches.push(Array2::zeros((0, 0)));
+            }
         }
 
         // Attempt to get a good alignment with backtracking.
@@ -326,6 +345,13 @@ impl ComparisonPatchesSelector {
         deg_signal: &AudioSignal,
         analysis_window: &AnalysisWindow,
     ) -> Result<Vec<PatchSimilarityResult>, Box<dyn Error>> {
+        // Reuse a single spectrogram builder across all patches so that
+        // filter coefficients are computed once and the internal buffers
+        // are re-used.
+        let mut spect_builder = GammatoneSpectrogramBuilder::<NUM_BANDS>::new(
+            GammatoneFilterbank::new(constants::MINIMUM_FREQ),
+        );
+
         // Case: The patches are already matched.  Iterate over each pair.
         let mut realigned_results = Vec::<PatchSimilarityResult>::with_capacity(sim_results.len());
         realigned_results.resize(sim_results.len(), PatchSimilarityResult::default());
@@ -358,9 +384,6 @@ impl ComparisonPatchesSelector {
             let new_ref_duration = ref_audio_aligned.get_duration();
             let new_deg_duration = deg_audio_aligned.get_duration();
             // 3. Compute a new spectrogram for the degraded audio.
-            let mut spect_builder = GammatoneSpectrogramBuilder::<NUM_BANDS>::new(
-                GammatoneFilterbank::new(constants::MINIMUM_FREQ),
-            );
             let mut ref_spectrogram = spect_builder.build(&ref_audio_aligned, analysis_window)?;
             let mut deg_spectrogram = spect_builder.build(&deg_audio_aligned, analysis_window)?;
             // 4. Recreate an aligned degraded patch from the new spectrogram.

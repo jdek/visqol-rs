@@ -32,12 +32,34 @@ impl Spectrogram {
         self.data.mapv_inplace(sample_to_db);
     }
 
+    /// Converts to dB scale and clamps to floor in a single pass.
+    pub fn convert_to_db_and_raise_floor(&mut self, floor: f64) {
+        self.data.mapv_inplace(|element| {
+            let sample: f64 = if element == 0.0 {
+                f64::EPSILON
+            } else {
+                element.abs()
+            };
+            let db = 10.0 * sample.log10();
+            if db > floor { db } else { floor }
+        });
+    }
+
     /// Returns the minimum value of the spectrogram
     pub fn get_minimum(&self) -> f64 {
         *self
             .data
             .min()
             .expect("Failed to compute minimum for spectrogram")
+    }
+
+    /// Returns the minimum and subtracts it from both spectrograms in one pass
+    pub fn get_minimum_and_subtract_floor_pair(a: &mut Self, b: &mut Self) {
+        let a_min = *a.data.min().expect("Failed to compute minimum");
+        let b_min = *b.data.min().expect("Failed to compute minimum");
+        let lowest = a_min.min(b_min);
+        a.data -= lowest;
+        b.data -= lowest;
     }
 
     /// Elementwise subtraction of the spectrogram

@@ -9,6 +9,8 @@
     in {
     systems = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" "aarch64-linux" ];
 
+    rust.enable_unstable = true;
+
     fileset = lib.fileset.unions [
       (lib.fileset.fileFilter (file: file.hasExt "rs" || file.name == "Cargo.toml") src)
       (src + /Cargo.lock)

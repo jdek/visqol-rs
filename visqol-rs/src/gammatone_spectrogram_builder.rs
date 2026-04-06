@@ -10,6 +10,15 @@ use ndarray::{Array2, Axis};
 /// Produces a frequency domain representation from a time domain signal using a gammatone filterbank.
 pub struct GammatoneSpectrogramBuilder<const NUM_BANDS: usize> {
     filter_bank: GammatoneFilterbank<NUM_BANDS>,
+    /// Cached filter coefficients + sorted center freqs, keyed by (sample_rate, max_freq).
+    cached_coeffs: Option<CachedCoeffs>,
+}
+
+struct CachedCoeffs {
+    sample_rate: usize,
+    max_freq: f64,
+    filter_coeffs: ndarray::Array2<f64>,
+    center_freqs: Vec<f64>,
 }
 
 impl<const NUM_BANDS: usize> SpectrogramBuilder for GammatoneSpectrogramBuilder<NUM_BANDS> {
@@ -21,21 +30,36 @@ impl<const NUM_BANDS: usize> SpectrogramBuilder for GammatoneSpectrogramBuilder<
         let time_domain_signal = &signal.data_matrix;
         let sample_rate = signal.sample_rate;
         let max_freq = if NUM_BANDS == NUM_BANDS_SPEECH {
-            Self::SPEECH_MODE_MAX_FREQ
+            Self::SPEECH_MODE_MAX_FREQ as f64
         } else {
-            sample_rate / 2
+            sample_rate as f64 / 2.0
         };
 
-        // get gammatone coefficients
-        let (mut filter_coeffs, mut center_freqs) =
-            equivalent_rectangular_bandwidth::make_filters::<NUM_BANDS>(
-                sample_rate as usize,
-                self.filter_bank.min_freq,
-                max_freq as f64,
-            );
-        filter_coeffs.invert_axis(Axis(0));
-        self.filter_bank.set_filter_coefficients(&filter_coeffs);
-        self.filter_bank.reset_filter_conditions();
+        // Cache or reuse filter coefficients
+        let need_recompute = match &self.cached_coeffs {
+            Some(c) => c.sample_rate != sample_rate as usize || c.max_freq != max_freq,
+            None => true,
+        };
+
+        if need_recompute {
+            let (mut filter_coeffs, mut center_freqs) =
+                equivalent_rectangular_bandwidth::make_filters::<NUM_BANDS>(
+                    sample_rate as usize,
+                    self.filter_bank.min_freq,
+                    max_freq,
+                );
+            filter_coeffs.invert_axis(Axis(0));
+            center_freqs.sort_by(|a, b| a.partial_cmp(b).expect("Failed to sort center frequencies!"));
+            self.cached_coeffs = Some(CachedCoeffs {
+                sample_rate: sample_rate as usize,
+                max_freq,
+                filter_coeffs,
+                center_freqs,
+            });
+        }
+
+        let cached = self.cached_coeffs.as_ref().unwrap();
+        self.filter_bank.set_filter_coefficients(&cached.filter_coeffs);
 
         let hop_size = (window.size as f64 * window.overlap) as usize;
 
@@ -49,39 +73,29 @@ impl<const NUM_BANDS: usize> SpectrogramBuilder for GammatoneSpectrogramBuilder<
         let num_cols = 1 + ((time_domain_signal.len() - window.size) / hop_size);
         let mut out_matrix = Array2::<f64>::zeros((NUM_BANDS, num_cols));
 
-        for (index, frame) in time_domain_signal
-            .windows(window.size)
-            .into_iter()
+        // Pre-allocate a column buffer for RMS results
+        let mut rms_col = vec![0.0f64; NUM_BANDS];
+
+        let signal_slice = time_domain_signal
+            .as_slice()
+            .expect("Failed to convert audio signal to slice");
+
+        for (index, frame_start) in (0..=signal_slice.len() - window.size)
             .step_by(hop_size)
             .enumerate()
         {
+            let frame = &signal_slice[frame_start..frame_start + window.size];
+
             self.filter_bank.reset_filter_conditions();
-            let mut filtered_signal = self.filter_bank.apply_filter(
-                frame
-                    .as_slice()
-                    .expect("Failed to convert audio frame to slice"),
-            );
+            self.filter_bank.apply_filter_rms(frame, &mut rms_col);
 
-            filtered_signal.map_inplace(|e| *e = *e * *e);
-
-            let mut row_means = filtered_signal
-                .mean_axis(Axis(1))
-                .expect("Failed to compute means for gammatone spectrogram!");
-
-            row_means.map_inplace(|e| {
-                *e = e.sqrt();
-            });
-
-            for j in 0..row_means.to_vec().len() {
-                out_matrix[(j, index)] = row_means[j];
+            // Write RMS values directly into the output column
+            for j in 0..NUM_BANDS {
+                out_matrix[(j, index)] = rms_col[j];
             }
         }
 
-        center_freqs.as_mut_slice().sort_by(|a, b| {
-            a.partial_cmp(b)
-                .expect("Failed to sort center frequencies!")
-        });
-        Ok(Spectrogram::new(out_matrix, center_freqs))
+        Ok(Spectrogram::new(out_matrix, cached.center_freqs.clone()))
     }
 }
 
@@ -89,8 +103,12 @@ impl<const NUM_BANDS: usize> GammatoneSpectrogramBuilder<NUM_BANDS> {
     const SPEECH_MODE_MAX_FREQ: u32 = 8000;
 
     /// Creates a new gammatone spectrogram builder with the given gammatone filterbank.
-    /// If `use_speech_mode` is set to `true`, the maximum frequency is determined to be 8000 Hz.
-    pub fn new(filter_bank: GammatoneFilterbank<NUM_BANDS>) -> Self { Self { filter_bank } }
+    pub fn new(filter_bank: GammatoneFilterbank<NUM_BANDS>) -> Self {
+        Self {
+            filter_bank,
+            cached_coeffs: None,
+        }
+    }
 }
 
 #[cfg(test)]

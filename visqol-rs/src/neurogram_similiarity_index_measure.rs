@@ -1,6 +1,6 @@
 use crate::convolution_2d::perform_valid_2d_conv_with_boundary;
 use crate::patch_similarity_comparator::{PatchSimilarityComparator, PatchSimilarityResult};
-use ndarray::{arr2, Array1, Axis};
+use ndarray::{arr2, Array1, Axis, Zip};
 
 /// Provides a neurogram similarity index measure (NSIM) implementation for a
 /// patch similarity comparator. NSIM is a distance metric, adapted from the
@@ -24,6 +24,13 @@ impl Default for NeurogramSimiliarityIndexMeasure {
     }
 }
 
+// Pre-computed Gaussian window (constant, same every call)
+const W: [[f64; 3]; 3] = [
+    [0.0113033910173052, 0.0838251475442633, 0.0113033910173052],
+    [0.0838251475442633, 0.619485845753726, 0.0838251475442633],
+    [0.0113033910173052, 0.0838251475442633, 0.0113033910173052],
+];
+
 impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
     /// Computes the NSIM between `ref_patch` and `deg_patch` and returns the mean and standard deviation of each frequency band, the energy of the degraded patch and the similarity score.
     fn measure_patch_similarity(
@@ -31,11 +38,7 @@ impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
         ref_patch: &mut ndarray::Array2<f64>,
         deg_patch: &mut ndarray::Array2<f64>,
     ) -> PatchSimilarityResult {
-        let window = arr2(&[
-            [0.0113033910173052, 0.0838251475442633, 0.0113033910173052],
-            [0.0838251475442633, 0.619485845753726, 0.0838251475442633],
-            [0.0113033910173052, 0.0838251475442633, 0.0113033910173052],
-        ]);
+        let window = arr2(&W);
 
         let k = [0.01, 0.03];
         let c1 = (k[0] * self.intensity_range).powf(2.0);
@@ -49,8 +52,9 @@ impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
         let deg_mu_squared = &mu_deg * &mu_deg;
         let mu_r_mu_d = &mu_ref * &mu_deg;
 
-        let mut ref_neuro_sq = ref_patch.clone() * ref_patch.clone();
-        let mut deg_neuro_sq = deg_patch.clone() * deg_patch.clone();
+        // Compute squared arrays without cloning (mapv allocates one new array each)
+        let mut ref_neuro_sq = ref_patch.mapv(|x| x * x);
+        let mut deg_neuro_sq = deg_patch.mapv(|x| x * x);
 
         // Compute sigmas
         let conv2_ref_neuro_squared =
@@ -61,7 +65,10 @@ impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
             perform_valid_2d_conv_with_boundary(&window, &mut deg_neuro_sq);
         let sigma_deg_squared = &conv2_deg_neuro_squared - &deg_mu_squared;
 
-        let mut ref_neuro_deg = ref_patch.clone() * deg_patch.clone();
+        // Compute cross-product without cloning
+        let mut ref_neuro_deg = Zip::from(&*ref_patch)
+            .and(&*deg_patch)
+            .map_collect(|&r, &d| r * d);
         let conv2_ref_neuro_deg = perform_valid_2d_conv_with_boundary(&window, &mut ref_neuro_deg);
 
         let sigma_r_d = &conv2_ref_neuro_deg - &mu_r_mu_d;
@@ -74,16 +81,15 @@ impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
 
         // Compute structure
         let structure_numerator = &sigma_r_d + c3;
-        let mut structure_denominator = &sigma_ref_squared * &sigma_deg_squared;
 
-        // Avoid nans
-        structure_denominator.map_inplace(|element| {
-            *element = if *element < 0.0 {
-                c3
-            } else {
-                element.sqrt() + c3
-            }
-        });
+        // Compute structure denominator: sqrt(sigma_ref^2 * sigma_deg^2) + c3
+        // Fused into a single allocation with map_collect
+        let structure_denominator = Zip::from(&sigma_ref_squared)
+            .and(&sigma_deg_squared)
+            .map_collect(|&sr, &sd| {
+                let prod = sr * sd;
+                if prod < 0.0 { c3 } else { prod.sqrt() + c3 }
+            });
 
         let structure = &structure_numerator / &structure_denominator;
         let sim_map = &intensity * &structure;

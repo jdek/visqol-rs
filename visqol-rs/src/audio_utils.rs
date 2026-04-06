@@ -76,20 +76,14 @@ pub fn prepare_spectrograms_for_comparison(
     reference: &mut Spectrogram,
     degraded: &mut Spectrogram,
 ) {
-    reference.convert_to_db();
-    degraded.convert_to_db();
-    reference.raise_floor(NOISE_FLOOR_ABSOLUTE_DB);
-    degraded.raise_floor(NOISE_FLOOR_ABSOLUTE_DB);
+    // Fused dB conversion + absolute floor in a single pass (was 2 passes each)
+    reference.convert_to_db_and_raise_floor(NOISE_FLOOR_ABSOLUTE_DB);
+    degraded.convert_to_db_and_raise_floor(NOISE_FLOOR_ABSOLUTE_DB);
 
     reference.raise_floor_per_frame(NOISE_FLOOR_RELATIVE_TO_PEAK_DB, degraded);
 
-    let ref_floor = reference.get_minimum();
-    let deg_floor = degraded.get_minimum();
-    let lowest_floor = ref_floor.min(deg_floor);
-
-    reference.subtract_floor(lowest_floor);
-
-    degraded.subtract_floor(lowest_floor);
+    // Fused minimum computation + subtraction
+    Spectrogram::get_minimum_and_subtract_floor_pair(reference, degraded);
 }
 
 /// Clones all elements of `float_vector` into the real elements of a complex vector and sets all imaginary parts to 0.0.
