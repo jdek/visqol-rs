@@ -3,10 +3,11 @@
     flakelight-rust.url = "github:accelbread/flakelight-rust";
     flakelight-rust.inputs.naersk.inputs.nixpkgs.follows = "flakelight-rust/flakelight/nixpkgs";
   };
-  outputs = { flakelight-rust, ... }: flakelight-rust ./. ({ lib, src, config, ... }: {
+  outputs = { flakelight-rust, ... }: flakelight-rust ./. ({ lib, src, config, ... }:
+    let
+      cargoSrc = lib.fileset.toSource { root = src; inherit (config) fileset; };
+    in {
     systems = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" "aarch64-linux" ];
-
-    pname = "visqol";
 
     fileset = lib.fileset.unions [
       (lib.fileset.fileFilter (file: file.hasExt "rs" || file.name == "Cargo.toml") src)
@@ -19,8 +20,7 @@
       visqol-c = { naersk, defaultMeta, makePkgconfigItem, symlinkJoin, ... }:
         let
           clib = naersk.buildPackage {
-            name = "visqol-c-0.3.1";
-            src = lib.fileset.toSource { root = src; inherit (config) fileset; };
+            src = cargoSrc;
             cargoBuildOptions = default: default ++ [ "--package" "visqol-c" ];
             copyLibs = true;
             copyBins = false;
@@ -32,7 +32,7 @@
           };
           pc = makePkgconfigItem {
             name = "visqol";
-            inherit (clib) version;
+            version = clib.version;
             description = "C API for the ViSQOL perceptual audio quality metric";
             libs = [ "-L${clib}/lib" "-lvisqol_c" ];
             cflags = [ "-I${clib}/include" ];
