@@ -99,6 +99,9 @@ impl ComparisonPatchesSelector {
 
         // Attempt to get a good alignment with backtracking.
         for (index, ref_patch) in ref_patches.iter_mut().enumerate() {
+            // Precompute reference-only conv2d values once per ref_patch,
+            // saving 2 out of 5 conv2d calls per DP search offset.
+            scratch.precompute_ref(ref_patch);
             self.find_most_optimal_deg_patch(
                 spectrogram_data,
                 ref_patch,
@@ -140,6 +143,7 @@ impl ComparisonPatchesSelector {
             }
         }
 
+        scratch.invalidate_ref();
         let mut patch_index: i32 = (num_patches - 1) as i32;
         while patch_index >= 0 {
             let pi = patch_index as usize;

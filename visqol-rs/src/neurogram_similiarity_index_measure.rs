@@ -44,6 +44,10 @@ pub struct NsimScratch {
     conv_ref_sq: Array2<f64>,
     conv_deg_sq: Array2<f64>,
     conv_rd: Array2<f64>,
+    /// Precomputed sigma_ref_squared = conv(ref²) - mu_ref² (constant per ref patch).
+    precomp_srs: Array2<f64>,
+    /// Whether precomputed ref values are valid.
+    precomp_valid: bool,
 }
 
 impl NsimScratch {
@@ -58,6 +62,8 @@ impl NsimScratch {
             conv_ref_sq: Array2::zeros((nrows, ncols)),
             conv_deg_sq: Array2::zeros((nrows, ncols)),
             conv_rd: Array2::zeros((nrows, ncols)),
+            precomp_srs: Array2::zeros((nrows, ncols)),
+            precomp_valid: false,
         }
     }
 
@@ -67,11 +73,37 @@ impl NsimScratch {
             *self = Self::new(nrows, ncols);
         }
     }
+
+    /// Precompute reference-only values: mu_ref, conv_ref_sq, and sigma_ref_sq.
+    /// Call once per ref_patch before the DP search loop.
+    pub fn precompute_ref(&mut self, ref_patch: &Array2<f64>) {
+        let window = &*WINDOW;
+        conv2d_3x3_reflected_into(window, ref_patch, &mut self.mu_ref);
+        Zip::from(&mut self.ref_neuro_sq)
+            .and(ref_patch)
+            .for_each(|o, &r| *o = r * r);
+        conv2d_3x3_reflected_into(window, &self.ref_neuro_sq, &mut self.conv_ref_sq);
+        // precomp_srs = conv_ref_sq - mu_ref²
+        Zip::from(&mut self.precomp_srs)
+            .and(&self.conv_ref_sq)
+            .and(&self.mu_ref)
+            .for_each(|o, &crsq, &mr| *o = crsq - mr * mr);
+        self.precomp_valid = true;
+    }
+
+    /// Invalidate precomputed ref values (call when ref_patch changes).
+    pub fn invalidate_ref(&mut self) {
+        self.precomp_valid = false;
+    }
 }
 
 impl NeurogramSimiliarityIndexMeasure {
     /// Scalar similarity using pre-allocated scratch buffers.
     /// Avoids all heap allocations in the hot DP loop.
+    ///
+    /// If `s.precomp_valid` is true, skips recomputing reference-only values
+    /// (mu_ref, conv_ref_sq, sigma_ref_sq), saving 2 out of 5 conv2d calls
+    /// and 1 element-wise op per invocation.
     #[inline]
     pub fn measure_similarity_scalar_scratched(
         &self,
@@ -84,14 +116,21 @@ impl NeurogramSimiliarityIndexMeasure {
         let c1 = (0.01 * self.intensity_range) * (0.01 * self.intensity_range);
         let c3 = (0.03 * self.intensity_range) * (0.03 * self.intensity_range) / 2.0;
 
-        // Conv2d into scratch buffers
-        conv2d_3x3_reflected_into(window, ref_patch, &mut s.mu_ref);
-        conv2d_3x3_reflected_into(window, deg_patch, &mut s.mu_deg);
+        if !s.precomp_valid {
+            // Compute reference-only values (fallback when not precomputed)
+            conv2d_3x3_reflected_into(window, ref_patch, &mut s.mu_ref);
+            Zip::from(&mut s.ref_neuro_sq)
+                .and(ref_patch)
+                .for_each(|o, &r| *o = r * r);
+            conv2d_3x3_reflected_into(window, &s.ref_neuro_sq, &mut s.conv_ref_sq);
+            Zip::from(&mut s.precomp_srs)
+                .and(&s.conv_ref_sq)
+                .and(&s.mu_ref)
+                .for_each(|o, &crsq, &mr| *o = crsq - mr * mr);
+        }
 
-        // Compute squared inputs into scratch
-        Zip::from(&mut s.ref_neuro_sq)
-            .and(ref_patch)
-            .for_each(|o, &r| *o = r * r);
+        // Degraded-only values (always recomputed)
+        conv2d_3x3_reflected_into(window, deg_patch, &mut s.mu_deg);
         Zip::from(&mut s.deg_neuro_sq)
             .and(deg_patch)
             .for_each(|o, &d| *o = d * d);
@@ -99,25 +138,21 @@ impl NeurogramSimiliarityIndexMeasure {
             .and(ref_patch)
             .and(deg_patch)
             .for_each(|o, &r, &d| *o = r * d);
-
-        // Conv of squared/cross inputs
-        conv2d_3x3_reflected_into(window, &s.ref_neuro_sq, &mut s.conv_ref_sq);
         conv2d_3x3_reflected_into(window, &s.deg_neuro_sq, &mut s.conv_deg_sq);
         conv2d_3x3_reflected_into(window, &s.ref_neuro_deg, &mut s.conv_rd);
 
-        // Fused scalar accumulation: intensity * structure
+        // Fused scalar accumulation using precomputed sigma_ref_squared
         let n = s.mu_ref.len() as f64;
         let mut sum = 0.0f64;
         Zip::from(&s.mu_ref)
             .and(&s.mu_deg)
-            .and(&s.conv_ref_sq)
+            .and(&s.precomp_srs)
             .and(&s.conv_deg_sq)
             .and(&s.conv_rd)
-            .for_each(|&mr, &md, &crsq, &cdsq, &crd| {
-                let rms = mr * mr;
+            .for_each(|&mr, &md, &srs, &cdsq, &crd| {
                 let dms = md * md;
                 let mrd = mr * md;
-                let srs = crsq - rms;
+                let rms = mr * mr;
                 let sds = cdsq - dms;
                 let srd = crd - mrd;
                 let intensity = (2.0 * mrd + c1) / (rms + dms + c1);
