@@ -23,6 +23,7 @@
         let
           clib = naersk.buildPackage {
             src = cargoSrc;
+            RUSTC_BOOTSTRAP = 1;
             cargoBuildOptions = default: default ++ [ "--package" "visqol-c" ];
             copyLibs = true;
             copyBins = false;
