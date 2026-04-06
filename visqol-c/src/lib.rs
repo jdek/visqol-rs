@@ -6,8 +6,6 @@ use visqol_rs::constants::{NUM_BANDS_AUDIO, NUM_BANDS_SPEECH};
 use visqol_rs::support_vector_regression_model::SupportVectorRegressionModel;
 use visqol_rs::variant::Variant;
 use visqol_rs::visqol_manager::VisqolManager;
-use visqol_rs::VisqolRef;
-
 const DEFAULT_MODEL_CONTENT: &str = include_str!("../../model/libsvm_nu_svr_model.txt");
 
 enum Manager {
@@ -18,6 +16,11 @@ enum Manager {
 /// Opaque handle to a ViSQOL instance.
 pub struct VisqolHandle {
     manager: Manager,
+}
+
+/// Opaque handle to a prepared reference signal.
+pub struct VisqolRef {
+    inner: visqol_rs::VisqolRef,
 }
 
 /// Result of a ViSQOL comparison.
@@ -162,7 +165,7 @@ pub extern "C" fn visqol_prepare_ref(
     };
 
     match result {
-        Ok(prepared) => Box::into_raw(Box::new(prepared)),
+        Ok(prepared) => Box::into_raw(Box::new(VisqolRef { inner: prepared })),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -188,7 +191,7 @@ pub extern "C" fn visqol_run_with_ref(
     }
 
     let h = unsafe { &mut *handle };
-    let prepared = unsafe { &*prepared_ref };
+    let prepared = unsafe { &(*prepared_ref).inner };
     let deg_path = match unsafe { CStr::from_ptr(degraded_path) }.to_str() {
         Ok(s) => s,
         Err(_) => return -1,
@@ -217,9 +220,7 @@ pub extern "C" fn visqol_run_with_ref(
 #[no_mangle]
 pub extern "C" fn visqol_prepared_ref_destroy(prepared_ref: *mut VisqolRef) {
     if !prepared_ref.is_null() {
-        unsafe {
-            drop(Box::from_raw(prepared_ref));
-        }
+        drop(unsafe { Box::from_raw(prepared_ref) });
     }
 }
 

@@ -12,6 +12,11 @@
 typedef struct VisqolHandle VisqolHandle;
 
 /**
+ * Opaque handle to a prepared reference signal.
+ */
+typedef struct VisqolRef VisqolRef;
+
+/**
  * Result of a ViSQOL comparison.
  */
 typedef struct VisqolResult {
@@ -75,7 +80,7 @@ int32_t visqol_run(struct VisqolHandle *handle,
  * Returns a handle that must be freed with `visqol_prepared_ref_destroy`.
  * Returns null on error.
  */
-VisqolRef *visqol_prepare_ref(struct VisqolHandle *handle, const char *reference_path);
+struct VisqolRef *visqol_prepare_ref(struct VisqolHandle *handle, const char *reference_path);
 
 /**
  * Run a comparison using a prepared reference.
@@ -88,7 +93,7 @@ VisqolRef *visqol_prepare_ref(struct VisqolHandle *handle, const char *reference
  * Returns 0 on success, -1 on error.
  */
 int32_t visqol_run_with_ref(struct VisqolHandle *handle,
-                            const VisqolRef *prepared_ref,
+                            const struct VisqolRef *prepared_ref,
                             const char *degraded_path,
                             struct VisqolResult *result_out);
 
@@ -97,7 +102,7 @@ int32_t visqol_run_with_ref(struct VisqolHandle *handle,
  *
  * Passing null is a no-op.
  */
-void visqol_prepared_ref_destroy(VisqolRef *prepared_ref);
+void visqol_prepared_ref_destroy(struct VisqolRef *prepared_ref);
 
 /**
  * Run a comparison from raw PCM buffers (no file I/O).

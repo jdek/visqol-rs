@@ -6,6 +6,8 @@
   outputs = { flakelight-rust, ... }: flakelight-rust ./. ({ lib, src, config, ... }: {
     systems = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" "aarch64-linux" ];
 
+    pname = "visqol";
+
     fileset = lib.fileset.unions [
       (lib.fileset.fileFilter (file: file.hasExt "rs" || file.name == "Cargo.toml") src)
       (src + /Cargo.lock)
