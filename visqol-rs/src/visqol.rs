@@ -16,7 +16,8 @@ use std::error::Error;
 /// files against the same reference.
 pub(crate) struct VisqolRef {
     pub signal: AudioSignal,
-    pub raw_spectrogram: Spectrogram,
+    /// Reference spectrogram already converted to dB scale.
+    pub db_spectrogram: Spectrogram,
     pub patch_indices: Vec<usize>,
     pub window: AnalysisWindow,
     pub frame_duration: f64,
@@ -38,7 +39,7 @@ pub(crate) fn prepare_reference<const NUM_BANDS: usize>(
         constants::WINDOW_DURATION,
     );
 
-    let ref_spectrogram = spect_builder.build(ref_signal, &window)?;
+    let mut ref_spectrogram = spect_builder.build(ref_signal, &window)?;
 
     let ref_patch_indices =
         patch_creator.create_ref_patch_indices(&ref_spectrogram.data, ref_signal, &window)?;
@@ -48,9 +49,12 @@ pub(crate) fn prepare_reference<const NUM_BANDS: usize>(
         ref_signal.sample_rate as usize,
     );
 
+    // Pre-convert to dB so we don't redo this per comparison
+    audio_utils::convert_spectrogram_to_db(&mut ref_spectrogram);
+
     Ok(VisqolRef {
         signal: ref_signal.clone(),
-        raw_spectrogram: ref_spectrogram,
+        db_spectrogram: ref_spectrogram,
         patch_indices: ref_patch_indices,
         window,
         frame_duration,
@@ -74,12 +78,12 @@ pub(crate) fn calculate_similarity_with_cache<const NUM_BANDS: usize>(
         GammatoneFilterbank::new(constants::MINIMUM_FREQ),
     );
 
-    // Clone the cached raw reference spectrogram; the floor normalization
-    // step will mutate it in a way that depends on the degraded signal.
-    let mut ref_spectrogram = cache.raw_spectrogram.clone();
+    // Clone the cached dB-converted reference spectrogram; the floor
+    // normalization step will mutate it depending on the degraded signal.
+    let mut ref_spectrogram = cache.db_spectrogram.clone();
     let mut deg_spectrogram = spect_builder.build(deg_signal, &cache.window)?;
 
-    audio_utils::prepare_spectrograms_for_comparison(&mut ref_spectrogram, &mut deg_spectrogram);
+    audio_utils::prepare_spectrograms_for_comparison_ref_db(&mut ref_spectrogram, &mut deg_spectrogram);
 
     let mut ref_patch_indices = cache.patch_indices.clone();
     let mut ref_patches =

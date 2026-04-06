@@ -1,4 +1,4 @@
-use ndarray::{Array2, Axis};
+use ndarray::Array2;
 use ndarray_stats::QuantileExt;
 
 /// Contains the spectral representation of audio data
@@ -72,21 +72,36 @@ impl Spectrogram {
 
     /// Given a noise threshold and a second spectrogram, both spectrograms are raised to share the same noise floor specified by `noise_threshold`
     pub fn raise_floor_per_frame(&mut self, noise_threshold: f64, other: &mut Self) {
-        let min_columns = self.data.ncols().min(other.data.ncols());
+        let nrows = self.data.nrows();
+        let ncols_self = self.data.ncols();
+        let ncols_other = other.data.ncols();
+        let min_columns = ncols_self.min(ncols_other);
 
-        for index in 0..min_columns {
-            let our_frame = &mut self.data.index_axis_mut(Axis(1), index);
-            let other_frame = &mut other.data.index_axis_mut(Axis(1), index);
-            let our_max = our_frame
-                .max()
-                .expect("Failed to raise level for spectrogram!");
-            let other_max = other_frame
-                .max()
-                .expect("Failed to raise level for spectrogram!");
-            let any_max = our_max.max(*other_max);
+        // Work on raw slices for cache-friendly strided access.
+        let self_slice = self.data.as_slice_mut()
+            .expect("spectrogram data not contiguous");
+        let other_slice = other.data.as_slice_mut()
+            .expect("spectrogram data not contiguous");
+
+        for col in 0..min_columns {
+            // Find max across both spectrograms for this column.
+            // Data is row-major: element (r, c) is at offset r * ncols + c.
+            let mut any_max = f64::NEG_INFINITY;
+            for r in 0..nrows {
+                let sv = self_slice[r * ncols_self + col];
+                let ov = other_slice[r * ncols_other + col];
+                let m = sv.max(ov);
+                if m > any_max { any_max = m; }
+            }
             let floor_db = any_max - noise_threshold;
-            our_frame.mapv_inplace(|element| floor_db.max(element));
-            other_frame.mapv_inplace(|element| floor_db.max(element));
+
+            // Clamp both columns to floor
+            for r in 0..nrows {
+                let si = r * ncols_self + col;
+                if self_slice[si] < floor_db { self_slice[si] = floor_db; }
+                let oi = r * ncols_other + col;
+                if other_slice[oi] < floor_db { other_slice[oi] = floor_db; }
+            }
         }
     }
 }

@@ -17,8 +17,8 @@ pub fn align_and_truncate(
 
     if best_lag == 0 || best_lag.abs() > (ref_signal.data_matrix.len() / 2) as i64 {
         return Some((
-            AudioSignal::new(ref_signal.data_matrix.as_slice()?, ref_signal.sample_rate),
-            AudioSignal::new(deg_signal.data_matrix.as_slice()?, deg_signal.sample_rate),
+            AudioSignal::from_owned(ref_signal.data_matrix.clone(), ref_signal.sample_rate),
+            AudioSignal::from_owned(deg_signal.data_matrix.clone(), deg_signal.sample_rate),
             0.0,
         ));
     }
@@ -26,38 +26,41 @@ pub fn align_and_truncate(
     let lag_f = best_lag as f64 / deg_signal.sample_rate as f64;
 
     // Align degraded signal
-    let mut new_deg_matrix = deg_signal.data_matrix.clone();
-    if best_lag < 0 {
-        new_deg_matrix = new_deg_matrix
+    let new_deg_matrix = if best_lag < 0 {
+        deg_signal.data_matrix
             .slice(s![best_lag.unsigned_abs() as usize..deg_signal.data_matrix.len()])
-            .to_owned();
+            .to_owned()
     } else {
         let zeros = Array1::<f64>::zeros(best_lag as usize);
-        new_deg_matrix = concatenate(Axis(0), &[zeros.view(), new_deg_matrix.view()])
-            .expect("Failed to zero pad degraded matrix!");
-    }
+        concatenate(Axis(0), &[zeros.view(), deg_signal.data_matrix.view()])
+            .expect("Failed to zero pad degraded matrix!")
+    };
 
     // Truncate to same length
-    let mut new_ref_matrix = ref_signal.data_matrix.clone();
-    match new_ref_matrix.len().cmp(&new_deg_matrix.len()) {
+    let (new_ref_matrix, new_deg_final) = match ref_signal.data_matrix.len().cmp(&new_deg_matrix.len()) {
         std::cmp::Ordering::Less => {
             let lag_samples = (lag_f * ref_signal.sample_rate as f64) as usize;
-            new_ref_matrix = new_ref_matrix
+            let r = ref_signal.data_matrix
                 .slice(s![lag_samples..ref_signal.len()])
                 .to_owned();
-            new_deg_matrix = new_deg_matrix
+            let d = new_deg_matrix
                 .slice(s![lag_samples..ref_signal.len()])
                 .to_owned();
+            (r, d)
         }
         std::cmp::Ordering::Greater => {
-            new_ref_matrix = new_ref_matrix.slice(s![..new_deg_matrix.len()]).to_owned();
+            let deg_len = new_deg_matrix.len();
+            let r = ref_signal.data_matrix.slice(s![..deg_len]).to_owned();
+            (r, new_deg_matrix)
         }
-        _ => (),
-    }
+        std::cmp::Ordering::Equal => {
+            (ref_signal.data_matrix.clone(), new_deg_matrix)
+        }
+    };
 
     Some((
-        AudioSignal::new(new_ref_matrix.as_slice()?, ref_signal.sample_rate),
-        AudioSignal::new(new_deg_matrix.as_slice()?, deg_signal.sample_rate),
+        AudioSignal::from_owned(new_ref_matrix, ref_signal.sample_rate),
+        AudioSignal::from_owned(new_deg_final, deg_signal.sample_rate),
         lag_f,
     ))
 }
@@ -75,28 +78,20 @@ pub fn globally_align(
 
     if best_lag == 0 || best_lag.abs() > (ref_signal.data_matrix.len() / 2) as i64 {
         let new_deg_signal =
-            AudioSignal::new(deg_signal.data_matrix.as_slice()?, deg_signal.sample_rate);
+            AudioSignal::from_owned(deg_signal.data_matrix.clone(), deg_signal.sample_rate);
         Some((new_deg_signal, 0.0f64))
     } else {
-        let mut new_deg_matrix = deg_signal.data_matrix.clone();
-        if best_lag < 0 {
-            new_deg_matrix = new_deg_matrix
-                .slice(s![
-                    best_lag.unsigned_abs() as usize..deg_signal.data_matrix.len()
-                ])
-                .to_owned();
+        let new_deg_matrix = if best_lag < 0 {
+            deg_signal.data_matrix
+                .slice(s![best_lag.unsigned_abs() as usize..deg_signal.data_matrix.len()])
+                .to_owned()
         } else {
             let zeros = Array1::<f64>::zeros(best_lag as usize);
-            new_deg_matrix = concatenate(Axis(0), &[zeros.view(), new_deg_matrix.view()])
-                .expect("Failed to zero pad degraded matrix!");
-        }
+            concatenate(Axis(0), &[zeros.view(), deg_signal.data_matrix.view()])
+                .expect("Failed to zero pad degraded matrix!")
+        };
 
-        let new_deg_signal = AudioSignal::new(
-            new_deg_matrix
-                .as_slice()
-                .expect("Failed to create AudioSignal from slice!"),
-            deg_signal.sample_rate,
-        );
+        let new_deg_signal = AudioSignal::from_owned(new_deg_matrix, deg_signal.sample_rate);
         Some((
             new_deg_signal,
             (best_lag as f64 / deg_signal.sample_rate as f64),

@@ -9,7 +9,7 @@ use std::simd::f64x4;
 /// fast-path when the filter is 3×3 (the only size used in ViSQOL).
 pub fn perform_valid_2d_conv_with_boundary(
     fir_filter: &Array2<f64>,
-    input_matrix: &mut Array2<f64>,
+    input_matrix: &Array2<f64>,
 ) -> Array2<f64> {
     let f_r = fir_filter.nrows();
     let f_c = fir_filter.ncols();
@@ -19,7 +19,8 @@ pub fn perform_valid_2d_conv_with_boundary(
     }
 
     // Fallback: general case (kept for correctness, not on hot path)
-    let padded_matrix = add_matrix_boundary(input_matrix);
+    let mut input_copy = input_matrix.clone();
+    let padded_matrix = add_matrix_boundary(&mut input_copy);
     let i_r_c = padded_matrix.nrows();
     let i_c_c = padded_matrix.ncols();
     let o_r_c = i_r_c - f_r + 1;
@@ -259,9 +260,9 @@ mod tests {
             43.6190, 41.0119, 40.4244, 41.5932, 43.6027, 42.6204, 43.0624, 42.2610, 42.4725,
             43.4258, 42.9079,
         ];
-        let mut matrix = Array::from_shape_vec((5, 4).f(), m).unwrap();
+        let matrix = Array::from_shape_vec((5, 4).f(), m).unwrap();
 
-        let result = perform_valid_2d_conv_with_boundary(&window, &mut matrix);
+        let result = perform_valid_2d_conv_with_boundary(&window, &matrix);
 
         let r = vec![
             40.6634, 42.8407, 40.6395, 41.0129, 41.5407, 42.4677, 44.2760, 44.2031, 41.2263,

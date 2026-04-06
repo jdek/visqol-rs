@@ -98,6 +98,25 @@ pub fn prepare_spectrograms_for_comparison(
     Spectrogram::get_minimum_and_subtract_floor_pair(reference, degraded);
 }
 
+/// Convert a single spectrogram to dB scale (used during reference preparation).
+pub fn convert_spectrogram_to_db(spectrogram: &mut Spectrogram) {
+    spectrogram.convert_to_db_and_raise_floor(NOISE_FLOOR_ABSOLUTE_DB);
+}
+
+/// Like `prepare_spectrograms_for_comparison` but assumes the reference
+/// is already dB-converted. Only converts the degraded spectrogram.
+pub fn prepare_spectrograms_for_comparison_ref_db(
+    reference: &mut Spectrogram,
+    degraded: &mut Spectrogram,
+) {
+    // Reference is already in dB — only convert degraded
+    degraded.convert_to_db_and_raise_floor(NOISE_FLOOR_ABSOLUTE_DB);
+
+    reference.raise_floor_per_frame(NOISE_FLOOR_RELATIVE_TO_PEAK_DB, degraded);
+
+    Spectrogram::get_minimum_and_subtract_floor_pair(reference, degraded);
+}
+
 /// Clones all elements of `float_vector` into the real elements of a complex vector and sets all imaginary parts to 0.0.
 pub fn float_vec_to_real_valued_complex_vec(float_vector: &[f64]) -> Vec<Complex64> {
     let mut complex_vec = vec![Complex64::zero(); float_vector.len()];

@@ -9,7 +9,7 @@ use crate::{
     audio_signal::AudioSignal,
     audio_utils,
     neurogram_similiarity_index_measure::{NeurogramSimiliarityIndexMeasure, NsimScratch},
-    patch_similarity_comparator::{PatchSimilarityComparator, PatchSimilarityResult},
+    patch_similarity_comparator::PatchSimilarityResult,
     spectrogram_builder::SpectrogramBuilder,
     visqol_error::VisqolError,
 };
@@ -56,9 +56,10 @@ impl ComparisonPatchesSelector {
         let mut best_deg_patches = Vec::<PatchSimilarityResult>::new();
         best_deg_patches.resize(num_patches, PatchSimilarityResult::default());
 
-        let mut cumulative_similarity_dp =
-            vec![vec![0.0f64; spectrogram_data.ncols()]; ref_patch_indices.len()];
-        let mut backtrace = vec![vec![0usize; spectrogram_data.ncols()]; ref_patch_indices.len()];
+        let dp_cols = spectrogram_data.ncols();
+        let dp_rows = ref_patch_indices.len();
+        let mut cumulative_similarity_dp = vec![0.0f64; dp_rows * dp_cols];
+        let mut backtrace = vec![0usize; dp_rows * dp_cols];
 
         // Only build deg patches within the search window range to avoid
         // allocating patches for offsets that will never be visited.
@@ -107,6 +108,7 @@ impl ComparisonPatchesSelector {
                 ref_patch_indices,
                 index,
                 search_window,
+                dp_cols,
                 &mut scratch,
             );
         }
@@ -132,53 +134,56 @@ impl ComparisonPatchesSelector {
                 break;
             }
 
-            if cumulative_similarity_dp[last_index][slide_offset] > max_similarity_score {
-                max_similarity_score = cumulative_similarity_dp[last_index][slide_offset];
+            if cumulative_similarity_dp[last_index * dp_cols + slide_offset] > max_similarity_score {
+                max_similarity_score = cumulative_similarity_dp[last_index * dp_cols + slide_offset];
                 last_offset = slide_offset;
             }
         }
 
         let mut patch_index: i32 = (num_patches - 1) as i32;
         while patch_index >= 0 {
-            // This sets the reference and degraded patch start and end times.
-            let mut ref_patch = ref_patches[patch_index as usize].clone();
+            let pi = patch_index as usize;
+            let ref_ncols = ref_patches[pi].ncols();
 
-            let mut deg_patch = if last_offset >= global_lower && last_offset < global_upper {
-                deg_patches[last_offset].clone()
+            // Build a temporary deg patch only when outside the pre-built range.
+            let tmp_deg_patch;
+            let deg_patch_ref = if last_offset >= global_lower && last_offset < global_upper {
+                &deg_patches[last_offset]
             } else {
-                Self::build_degraded_patch(
+                tmp_deg_patch = Self::build_degraded_patch(
                     spectrogram_data,
                     last_offset,
-                    last_offset + ref_patch.ncols(),
-                )
+                    last_offset + ref_ncols,
+                );
+                &tmp_deg_patch
             };
 
-            best_deg_patches[patch_index as usize] = self
+            best_deg_patches[pi] = self
                 .sim_comparator
-                .measure_patch_similarity(&mut ref_patch, &mut deg_patch);
+                .measure_patch_similarity_scratched(&ref_patches[pi], deg_patch_ref, &mut scratch);
 
             // This condition is true only if no matching patch was found for the given
             // reference patch. In this case, the matched patch is essentially set to
             // NULL (which is different from a silent patch).
 
-            if last_offset == backtrace[patch_index as usize][last_offset] {
-                best_deg_patches[patch_index as usize].deg_patch_start_time = 0.0;
-                best_deg_patches[patch_index as usize].deg_patch_end_time = 0.0;
-                best_deg_patches[patch_index as usize].similarity = 0.0;
-                let num_rows = best_deg_patches[patch_index as usize].freq_band_means.len();
-                best_deg_patches[patch_index as usize].freq_band_means = vec![0.0; num_rows];
+            if last_offset == backtrace[pi * dp_cols + last_offset] {
+                best_deg_patches[pi].deg_patch_start_time = 0.0;
+                best_deg_patches[pi].deg_patch_end_time = 0.0;
+                best_deg_patches[pi].similarity = 0.0;
+                let num_rows = best_deg_patches[pi].freq_band_means.len();
+                best_deg_patches[pi].freq_band_means = vec![0.0; num_rows];
             } else {
-                best_deg_patches[patch_index as usize].deg_patch_start_time =
+                best_deg_patches[pi].deg_patch_start_time =
                     last_offset as f64 * frame_duration;
-                best_deg_patches[patch_index as usize].deg_patch_end_time =
-                    best_deg_patches[patch_index as usize].deg_patch_start_time + patch_duration;
+                best_deg_patches[pi].deg_patch_end_time =
+                    best_deg_patches[pi].deg_patch_start_time + patch_duration;
             }
 
-            best_deg_patches[patch_index as usize].ref_patch_start_time =
-                ref_patch_indices[patch_index as usize] as f64 * frame_duration;
-            best_deg_patches[patch_index as usize].ref_patch_end_time =
-                best_deg_patches[patch_index as usize].ref_patch_start_time + patch_duration;
-            last_offset = backtrace[patch_index as usize][last_offset];
+            best_deg_patches[pi].ref_patch_start_time =
+                ref_patch_indices[pi] as f64 * frame_duration;
+            best_deg_patches[pi].ref_patch_end_time =
+                best_deg_patches[pi].ref_patch_start_time + patch_duration;
+            last_offset = backtrace[pi * dp_cols + last_offset];
 
             patch_index -= 1;
         }
@@ -191,65 +196,78 @@ impl ComparisonPatchesSelector {
         spectrogram_data: &Array2<f64>,
         ref_patch: &mut Array2<f64>,
         deg_patches: &mut [Array2<f64>],
-        cumulative_similarity_dp: &mut [Vec<f64>],
-        backtrace: &mut [Vec<usize>],
+        cumulative_similarity_dp: &mut [f64],
+        backtrace: &mut [usize],
         ref_patch_indices: &[usize],
         patch_index: usize,
         search_window: i32,
+        dp_cols: usize,
         scratch: &mut NsimScratch,
     ) {
         let ref_frame_index = ref_patch_indices[patch_index];
 
-        let mut slide_offset = ref_frame_index as i32 - search_window;
-        while slide_offset <= ref_frame_index as i32 + search_window {
-            if slide_offset < 0 {
-                // The degraded patch index cannot be less than 0.
-                slide_offset = 0;
-                continue;
-            }
+        let start_offset = (ref_frame_index as i32 - search_window).max(0);
+        let end_offset = (ref_frame_index as i32 + search_window)
+            .min(spectrogram_data.ncols() as i32 - 1);
 
-            if slide_offset == spectrogram_data.ncols() as i32 {
-                // The start of the degraded is past the end of the spectrogram, so
-                // nothing left to compare.
+        // For patch_index > 0: maintain a running max over
+        // dp[prev_row][lower_limit..slide_offset] so we avoid rescanning
+        // the previous row at every offset (O(1) instead of O(search_window)).
+        let (prev_row, lower_limit) = if patch_index > 0 {
+            let prev = (patch_index - 1) * dp_cols;
+            let ll = (ref_patch_indices[patch_index - 1] as i32 - search_window).max(0);
+            (prev, ll)
+        } else {
+            (0, 0)
+        };
+        let mut running_max = f64::MIN;
+        let mut running_max_idx: i32 = -1;
 
-                break;
+        // Seed running_max with dp values from lower_limit up to (but not
+        // including) start_offset — these are offsets that the original
+        // backward scan would have covered on the very first iteration.
+        if patch_index > 0 {
+            for i in lower_limit..start_offset {
+                let val = cumulative_similarity_dp[prev_row + i as usize];
+                if val > running_max {
+                    running_max = val;
+                    running_max_idx = i;
+                }
             }
+        }
+
+        for slide_offset in start_offset..=end_offset {
             let deg_patch = &deg_patches[slide_offset as usize];
             let mut similarity = self
                 .sim_comparator
                 .measure_similarity_scalar_scratched(ref_patch, deg_patch, scratch);
-            let mut past_slide_offset = -1;
-            let mut highest_sim = f64::MIN;
+            let mut past_slide_offset: i32 = -1;
 
             if patch_index > 0 {
-                let mut lower_limit: i32 =
-                    ref_patch_indices[patch_index - 1] as i32 - search_window;
-                lower_limit = lower_limit.max(0);
-                let mut back_offset = slide_offset - 1;
-
-                while back_offset >= lower_limit {
-                    if cumulative_similarity_dp[patch_index - 1][back_offset as usize] > highest_sim
-                    {
-                        highest_sim =
-                            cumulative_similarity_dp[patch_index - 1][back_offset as usize];
-                        past_slide_offset = back_offset;
-                    }
-                    back_offset -= 1;
-                }
+                // running_max holds max of dp[prev][lower_limit..slide_offset]
+                let highest_sim = running_max;
+                past_slide_offset = running_max_idx;
 
                 similarity += highest_sim;
 
-                if cumulative_similarity_dp[patch_index - 1][slide_offset as usize]
+                // Check "no-move" option: previous patch at same offset
+                if cumulative_similarity_dp[prev_row + slide_offset as usize]
                     > similarity
                 {
                     similarity =
-                        cumulative_similarity_dp[patch_index - 1][slide_offset as usize];
+                        cumulative_similarity_dp[prev_row + slide_offset as usize];
                     past_slide_offset = slide_offset;
                 }
+
+                // Extend running_max to include current slide_offset for next iteration
+                let cur_prev_val = cumulative_similarity_dp[prev_row + slide_offset as usize];
+                if cur_prev_val > running_max {
+                    running_max = cur_prev_val;
+                    running_max_idx = slide_offset;
+                }
             }
-            cumulative_similarity_dp[patch_index][slide_offset as usize] = similarity;
-            backtrace[patch_index][slide_offset as usize] = past_slide_offset as usize;
-            slide_offset += 1;
+            cumulative_similarity_dp[patch_index * dp_cols + slide_offset as usize] = similarity;
+            backtrace[patch_index * dp_cols + slide_offset as usize] = past_slide_offset as usize;
         }
     }
 
@@ -298,12 +316,7 @@ impl ComparisonPatchesSelector {
                 concatenate(Axis(0), &[pre_silence_matrix.view(), sliced_matrix.view()])
                     .expect("Failed to zero-pad patch!");
         }
-        AudioSignal::new(
-            sliced_matrix
-                .as_slice()
-                .expect("Failed to create AudioSignal from slice!"),
-            in_signal.sample_rate,
-        )
+        AudioSignal::from_owned(sliced_matrix, in_signal.sample_rate)
     }
 
     pub fn build_degraded_patch(
@@ -348,6 +361,7 @@ impl ComparisonPatchesSelector {
         // Case: The patches are already matched.  Iterate over each pair.
         let mut realigned_results = Vec::<PatchSimilarityResult>::with_capacity(sim_results.len());
         realigned_results.resize(sim_results.len(), PatchSimilarityResult::default());
+        let mut scratch = NsimScratch::new(0, 0);
         for (i, result) in sim_results.iter_mut().enumerate() {
             if result.deg_patch_start_time == result.deg_patch_end_time
                 && result.deg_patch_start_time == 0.0
@@ -394,9 +408,10 @@ impl ComparisonPatchesSelector {
             );
             // 5. Update the similarity result with the new patch.
 
+            scratch.ensure_size(ref_spectrogram.data.nrows(), ref_spectrogram.data.ncols());
             let mut new_sim_result = self
                 .sim_comparator
-                .measure_patch_similarity(&mut ref_spectrogram.data, &mut deg_spectrogram.data);
+                .measure_patch_similarity_scratched(&ref_spectrogram.data, &deg_spectrogram.data, &mut scratch);
             // Compare to the old result and take the max.
             if new_sim_result.similarity < result.similarity {
                 realigned_results[i] = result.clone();

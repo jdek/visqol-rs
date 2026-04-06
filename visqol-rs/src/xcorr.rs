@@ -2,29 +2,45 @@ use crate::fast_fourier_transform;
 use crate::fft_manager::FftManager;
 use num::complex::Complex64;
 
-/// Calculate the maximum delay between to signals.
+/// Calculate the maximum delay between two signals.
 pub fn calculate_best_lag(signal_1: &[f64], signal_2: &[f64]) -> Option<i64> {
     let max_lag = ((signal_1.len().max(signal_2.len())) - 1) as i64;
 
+    let mut sig1 = signal_1.to_vec();
+    let mut sig2 = signal_2.to_vec();
     let point_wise_fft_vec =
-        calculate_inverse_fft_pointwise_product(&mut signal_1.to_vec(), &mut signal_2.to_vec());
-    // Negative errors
-    let mut corrs = point_wise_fft_vec[point_wise_fft_vec.len() - max_lag as usize..].to_vec();
-    // Positive errors
-    let mut positives = point_wise_fft_vec[0..max_lag as usize + 1].to_vec();
+        calculate_inverse_fft_pointwise_product(&mut sig1, &mut sig2);
 
-    corrs.append(&mut positives);
+    // Find best correlation directly without rearranging.
+    // The correlation output is laid out as:
+    //   [0..max_lag+1]  = positive lags (indices 0..max_lag map to lags 0..max_lag)
+    //   [len-max_lag..] = negative lags (index len-k maps to lag -k)
+    //
+    // We search both regions and track the best absolute correlation.
+    let n = point_wise_fft_vec.len();
+    let neg_start = n - max_lag as usize;
+    let mut best_abs = f64::MIN;
+    let mut best_lag_result: i64 = 0;
 
-    // Get maximum
-    let best_corr = corrs[..].iter().max_by(|x, y| {
-        x.abs()
-            .partial_cmp(&y.abs())
-            .expect("Failed to compute correlation")
-    })?;
+    // Negative lags region
+    for i in neg_start..n {
+        let abs_val = point_wise_fft_vec[i].abs();
+        if abs_val > best_abs {
+            best_abs = abs_val;
+            best_lag_result = i as i64 - n as i64; // negative
+        }
+    }
 
-    let best_corr_idx = corrs.iter().position(|&r| r == *best_corr)?;
+    // Positive lags region
+    for i in 0..=(max_lag as usize) {
+        let abs_val = point_wise_fft_vec[i].abs();
+        if abs_val > best_abs {
+            best_abs = abs_val;
+            best_lag_result = i as i64; // positive
+        }
+    }
 
-    Some(best_corr_idx as i64 - max_lag)
+    Some(best_lag_result)
 }
 
 /// Calculates the pointwise inverse fft product of 2 signals

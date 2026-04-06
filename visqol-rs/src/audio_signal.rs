@@ -10,10 +10,18 @@ pub struct AudioSignal {
 }
 
 impl AudioSignal {
-    /// Creates a new `AudioSignal`.
+    /// Creates a new `AudioSignal` by copying the slice.
     pub fn new(data_matrix: &[f64], sample_rate: u32) -> AudioSignal {
         AudioSignal {
             data_matrix: Array1::from_vec(data_matrix.to_vec()),
+            sample_rate,
+        }
+    }
+
+    /// Creates a new `AudioSignal` from an owned `Array1`, avoiding a copy.
+    pub fn from_owned(data_matrix: Array1<f64>, sample_rate: u32) -> AudioSignal {
+        AudioSignal {
+            data_matrix,
             sample_rate,
         }
     }
