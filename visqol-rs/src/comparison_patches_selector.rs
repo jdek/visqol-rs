@@ -374,6 +374,13 @@ impl ComparisonPatchesSelector {
                 align_and_truncate(&ref_patch_audio, &deg_patch_audio)
                     .ok_or(VisqolError::FailedToAlignSignals)?;
 
+            // If lag is zero, signals are already aligned — skip the expensive
+            // spectrogram rebuild and keep the coarse result.
+            if lag == 0.0 {
+                realigned_results[i] = result.clone();
+                continue;
+            }
+
             let new_ref_duration = ref_audio_aligned.get_duration();
             let new_deg_duration = deg_audio_aligned.get_duration();
             // 3. Compute a new spectrogram for the degraded audio.

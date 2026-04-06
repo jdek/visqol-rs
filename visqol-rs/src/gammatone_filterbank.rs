@@ -179,10 +179,29 @@ impl<const NUM_BANDS: usize> GammatoneFilterbank<NUM_BANDS> {
         let sig_len = input_signal.len();
         let inv_len = 1.0 / sig_len as f64;
 
-        // Process pairs of bands with SIMD
+        // Process quads (4 bands = 2 interleaved band-pairs) for better ILP.
+        // While one pair waits on IIR dependency chain, the other pair executes.
         let num_pairs = NUM_BANDS / 2;
-        for pair in 0..num_pairs {
-            let b0 = pair * 2;
+        let num_quads = num_pairs / 2;
+        for quad in 0..num_quads {
+            let b0 = quad * 4;
+            Self::apply_filter_quad_rms_fresh(
+                &self.filter_coeff_a0,
+                &self.filter_coeff_a11,
+                &self.filter_coeff_a12,
+                &self.filter_coeff_a13,
+                &self.filter_coeff_a14,
+                &self.filter_coeff_a2,
+                &self.filter_coeff_b1,
+                &self.filter_coeff_b2,
+                &self.filter_coeff_gain,
+                b0, input_signal, inv_len, rms_out,
+            );
+        }
+
+        // Handle remaining pair if num_pairs is odd
+        if num_pairs % 2 == 1 {
+            let b0 = (num_quads * 2) * 2;
             let b1 = b0 + 1;
             Self::apply_filter_pair_rms_fresh(
                 &self.filter_coeff_a0,
@@ -300,6 +319,108 @@ impl<const NUM_BANDS: usize> GammatoneFilterbank<NUM_BANDS> {
         let sq = sum_sq.to_array();
         rms_out[b0] = (sq[0] * inv_len).sqrt();
         rms_out[b1_idx] = (sq[1] * inv_len).sqrt();
+    }
+
+    /// Process 4 bands (2 interleaved band-pairs) for better ILP.
+    /// Interleaves operations from two independent band-pairs so the CPU
+    /// can execute pair1's instructions while pair0 waits on IIR dependencies.
+    #[inline(always)]
+    fn apply_filter_quad_rms_fresh(
+        a0: &[f64], a11: &[f64], a12: &[f64], a13: &[f64], a14: &[f64],
+        a2: &[f64], b1: &[f64], b2: &[f64], gain: &[f64],
+        b_start: usize, input_signal: &[f64], inv_len: f64, rms_out: &mut [f64],
+    ) {
+        // Pair A: bands b_start, b_start+1
+        // Pair B: bands b_start+2, b_start+3
+        let (ba0, ba1) = (b_start, b_start + 1);
+        let (bb0, bb1) = (b_start + 2, b_start + 3);
+
+        let gia0 = 1.0 / gain[ba0]; let gia1 = 1.0 / gain[ba1];
+        let gib0 = 1.0 / gain[bb0]; let gib1 = 1.0 / gain[bb1];
+
+        // Pair A coefficients
+        let a_s1_n0 = f64x2::from_array([a0[ba0] * gia0, a0[ba1] * gia1]);
+        let a_s1_n1 = f64x2::from_array([a11[ba0] * gia0, a11[ba1] * gia1]);
+        let a_s1_n2 = f64x2::from_array([a2[ba0] * gia0, a2[ba1] * gia1]);
+        let a_a0 = f64x2::from_array([a0[ba0], a0[ba1]]);
+        let a_a2 = f64x2::from_array([a2[ba0], a2[ba1]]);
+        let a_s2_n1 = f64x2::from_array([a12[ba0], a12[ba1]]);
+        let a_s3_n1 = f64x2::from_array([a13[ba0], a13[ba1]]);
+        let a_s4_n1 = f64x2::from_array([a14[ba0], a14[ba1]]);
+        let a_d1 = f64x2::from_array([b1[ba0], b1[ba1]]);
+        let a_d2 = f64x2::from_array([b2[ba0], b2[ba1]]);
+
+        // Pair B coefficients
+        let b_s1_n0 = f64x2::from_array([a0[bb0] * gib0, a0[bb1] * gib1]);
+        let b_s1_n1 = f64x2::from_array([a11[bb0] * gib0, a11[bb1] * gib1]);
+        let b_s1_n2 = f64x2::from_array([a2[bb0] * gib0, a2[bb1] * gib1]);
+        let b_a0 = f64x2::from_array([a0[bb0], a0[bb1]]);
+        let b_a2 = f64x2::from_array([a2[bb0], a2[bb1]]);
+        let b_s2_n1 = f64x2::from_array([a12[bb0], a12[bb1]]);
+        let b_s3_n1 = f64x2::from_array([a13[bb0], a13[bb1]]);
+        let b_s4_n1 = f64x2::from_array([a14[bb0], a14[bb1]]);
+        let b_d1 = f64x2::from_array([b1[bb0], b1[bb1]]);
+        let b_d2 = f64x2::from_array([b2[bb0], b2[bb1]]);
+
+        // Pair A state
+        let (mut a_s1c0, mut a_s1c1) = (f64x2::splat(0.0), f64x2::splat(0.0));
+        let (mut a_s2c0, mut a_s2c1) = (f64x2::splat(0.0), f64x2::splat(0.0));
+        let (mut a_s3c0, mut a_s3c1) = (f64x2::splat(0.0), f64x2::splat(0.0));
+        let (mut a_s4c0, mut a_s4c1) = (f64x2::splat(0.0), f64x2::splat(0.0));
+        // Pair B state
+        let (mut b_s1c0, mut b_s1c1) = (f64x2::splat(0.0), f64x2::splat(0.0));
+        let (mut b_s2c0, mut b_s2c1) = (f64x2::splat(0.0), f64x2::splat(0.0));
+        let (mut b_s3c0, mut b_s3c1) = (f64x2::splat(0.0), f64x2::splat(0.0));
+        let (mut b_s4c0, mut b_s4c1) = (f64x2::splat(0.0), f64x2::splat(0.0));
+
+        let mut a_sum_sq = f64x2::splat(0.0);
+        let mut b_sum_sq = f64x2::splat(0.0);
+
+        for &s in input_signal {
+            let sv = f64x2::splat(s);
+
+            // Stage 1 - interleaved
+            let a_f1 = a_s1_n0 * sv + a_s1c0;
+            let b_f1 = b_s1_n0 * sv + b_s1c0;
+            a_s1c0 = a_s1_n1 * sv + a_s1c1 - a_d1 * a_f1;
+            b_s1c0 = b_s1_n1 * sv + b_s1c1 - b_d1 * b_f1;
+            a_s1c1 = a_s1_n2 * sv - a_d2 * a_f1;
+            b_s1c1 = b_s1_n2 * sv - b_d2 * b_f1;
+
+            // Stage 2 - interleaved
+            let a_f2 = a_a0 * a_f1 + a_s2c0;
+            let b_f2 = b_a0 * b_f1 + b_s2c0;
+            a_s2c0 = a_s2_n1 * a_f1 + a_s2c1 - a_d1 * a_f2;
+            b_s2c0 = b_s2_n1 * b_f1 + b_s2c1 - b_d1 * b_f2;
+            a_s2c1 = a_a2 * a_f1 - a_d2 * a_f2;
+            b_s2c1 = b_a2 * b_f1 - b_d2 * b_f2;
+
+            // Stage 3 - interleaved
+            let a_f3 = a_a0 * a_f2 + a_s3c0;
+            let b_f3 = b_a0 * b_f2 + b_s3c0;
+            a_s3c0 = a_s3_n1 * a_f2 + a_s3c1 - a_d1 * a_f3;
+            b_s3c0 = b_s3_n1 * b_f2 + b_s3c1 - b_d1 * b_f3;
+            a_s3c1 = a_a2 * a_f2 - a_d2 * a_f3;
+            b_s3c1 = b_a2 * b_f2 - b_d2 * b_f3;
+
+            // Stage 4 - interleaved + accumulate
+            let a_f4 = a_a0 * a_f3 + a_s4c0;
+            let b_f4 = b_a0 * b_f3 + b_s4c0;
+            a_s4c0 = a_s4_n1 * a_f3 + a_s4c1 - a_d1 * a_f4;
+            b_s4c0 = b_s4_n1 * b_f3 + b_s4c1 - b_d1 * b_f4;
+            a_s4c1 = a_a2 * a_f3 - a_d2 * a_f4;
+            b_s4c1 = b_a2 * b_f3 - b_d2 * b_f4;
+
+            a_sum_sq += a_f4 * a_f4;
+            b_sum_sq += b_f4 * b_f4;
+        }
+
+        let a_sq = a_sum_sq.to_array();
+        rms_out[ba0] = (a_sq[0] * inv_len).sqrt();
+        rms_out[ba1] = (a_sq[1] * inv_len).sqrt();
+        let b_sq = b_sum_sq.to_array();
+        rms_out[bb0] = (b_sq[0] * inv_len).sqrt();
+        rms_out[bb1] = (b_sq[1] * inv_len).sqrt();
     }
 
     /// Scalar fallback for a single band with zero initial state.
