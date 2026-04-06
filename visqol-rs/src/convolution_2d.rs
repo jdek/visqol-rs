@@ -1,4 +1,5 @@
 use ndarray::{Array2, ShapeBuilder};
+use std::simd::f64x4;
 
 /// Computes the 2D convolution of `input_matrix` with `fir_filter`, using
 /// boundary reflection (replicate-padding). The output has the same dimensions
@@ -47,9 +48,26 @@ pub fn perform_valid_2d_conv_with_boundary(
 
 /// Specialized 3×3 convolution with replicate-boundary padding.
 /// Computes boundary reflections on-the-fly, avoiding all intermediate
-/// matrix allocations. Uses raw slice access for speed.
+/// matrix allocations. Uses raw slice access and SIMD for the interior.
 #[inline(always)]
 fn conv2d_3x3_reflected(filter: &Array2<f64>, input: &Array2<f64>) -> Array2<f64> {
+    let nrows = input.nrows();
+    let ncols = input.ncols();
+    let mut out = Array2::<f64>::zeros((nrows, ncols));
+    conv2d_3x3_reflected_core(filter, input, &mut out);
+    out
+}
+
+/// Same as `conv2d_3x3_reflected` but writes into a pre-allocated output.
+#[inline(always)]
+pub fn conv2d_3x3_reflected_into(filter: &Array2<f64>, input: &Array2<f64>, out: &mut Array2<f64>) {
+    debug_assert_eq!(input.nrows(), out.nrows());
+    debug_assert_eq!(input.ncols(), out.ncols());
+    conv2d_3x3_reflected_core(filter, input, out);
+}
+
+#[inline(always)]
+fn conv2d_3x3_reflected_core(filter: &Array2<f64>, input: &Array2<f64>, out: &mut Array2<f64>) {
     let nrows = input.nrows();
     let ncols = input.ncols();
 
@@ -65,7 +83,6 @@ fn conv2d_3x3_reflected(filter: &Array2<f64>, input: &Array2<f64>) -> Array2<f64
     let w22 = filter[(0, 0)];
 
     // Ensure input is contiguous so we can use raw slice access.
-    // The output is created in standard (C) order for contiguous row access.
     let input_c = if input.is_standard_layout() {
         None
     } else {
@@ -74,11 +91,19 @@ fn conv2d_3x3_reflected(filter: &Array2<f64>, input: &Array2<f64>) -> Array2<f64
     let inp = input_c.as_ref().unwrap_or(input);
     let inp_slice = inp.as_slice().expect("input not contiguous after layout fix");
 
-    let mut out = Array2::<f64>::zeros((nrows, ncols));
     let out_slice = out.as_slice_mut().expect("output not contiguous");
 
-    // Row accessor: row r, col c => inp_slice[r * ncols + c]
-    // Handle boundaries: first/last row and first/last col
+    // SIMD kernel weights
+    let sw00 = f64x4::splat(w00);
+    let sw01 = f64x4::splat(w01);
+    let sw02 = f64x4::splat(w02);
+    let sw10 = f64x4::splat(w10);
+    let sw11 = f64x4::splat(w11);
+    let sw12 = f64x4::splat(w12);
+    let sw20 = f64x4::splat(w20);
+    let sw21 = f64x4::splat(w21);
+    let sw22 = f64x4::splat(w22);
+
     for r in 0..nrows {
         let rm1 = if r == 0 { 0 } else { r - 1 };
         let rp1 = if r + 1 >= nrows { nrows - 1 } else { r + 1 };
@@ -87,25 +112,53 @@ fn conv2d_3x3_reflected(filter: &Array2<f64>, input: &Array2<f64>) -> Array2<f64
         let row_0 = r * ncols;
         let row_p1 = rp1 * ncols;
 
-        // First column (c=0): cm1 = 0, cp1 = 1 (or 0 if ncols==1)
+        // First column (c=0): boundary
         {
-            let c = 0;
             let cm1 = 0;
             let cp1 = if ncols > 1 { 1 } else { 0 };
 
-            out_slice[row_0 + c] = w00 * inp_slice[row_m1 + cm1]
-                + w01 * inp_slice[row_m1 + c]
+            out_slice[row_0] = w00 * inp_slice[row_m1 + cm1]
+                + w01 * inp_slice[row_m1]
                 + w02 * inp_slice[row_m1 + cp1]
                 + w10 * inp_slice[row_0 + cm1]
-                + w11 * inp_slice[row_0 + c]
+                + w11 * inp_slice[row_0]
                 + w12 * inp_slice[row_0 + cp1]
                 + w20 * inp_slice[row_p1 + cm1]
-                + w21 * inp_slice[row_p1 + c]
+                + w21 * inp_slice[row_p1]
                 + w22 * inp_slice[row_p1 + cp1];
         }
 
-        // Interior columns: no boundary checks needed
-        for c in 1..ncols.saturating_sub(1) {
+        // Interior columns with SIMD: process 4 at a time
+        let interior_end = ncols.saturating_sub(1);
+        let mut c = 1usize;
+        while c + 4 <= interior_end {
+            // Load 6 values per row (c-1..c+4) to cover 4 outputs
+            let load_m1 = |off: usize| f64x4::from_slice(&inp_slice[row_m1 + off..]);
+            let load_0 = |off: usize| f64x4::from_slice(&inp_slice[row_0 + off..]);
+            let load_p1 = |off: usize| f64x4::from_slice(&inp_slice[row_p1 + off..]);
+
+            let cm1 = c - 1;
+
+            let result = sw00 * load_m1(cm1)
+                + sw01 * load_m1(c)
+                + sw02 * load_m1(c + 1)
+                + sw10 * load_0(cm1)
+                + sw11 * load_0(c)
+                + sw12 * load_0(c + 1)
+                + sw20 * load_p1(cm1)
+                + sw21 * load_p1(c)
+                + sw22 * load_p1(c + 1);
+
+            let arr = result.to_array();
+            out_slice[row_0 + c] = arr[0];
+            out_slice[row_0 + c + 1] = arr[1];
+            out_slice[row_0 + c + 2] = arr[2];
+            out_slice[row_0 + c + 3] = arr[3];
+            c += 4;
+        }
+
+        // Scalar tail for remaining interior columns
+        while c < interior_end {
             let cm1 = c - 1;
             let cp1 = c + 1;
 
@@ -118,6 +171,7 @@ fn conv2d_3x3_reflected(filter: &Array2<f64>, input: &Array2<f64>) -> Array2<f64
                 + w20 * inp_slice[row_p1 + cm1]
                 + w21 * inp_slice[row_p1 + c]
                 + w22 * inp_slice[row_p1 + cp1];
+            c += 1;
         }
 
         // Last column (if ncols > 1)
@@ -137,10 +191,6 @@ fn conv2d_3x3_reflected(filter: &Array2<f64>, input: &Array2<f64>) -> Array2<f64
                 + w22 * inp_slice[row_p1 + cp1];
         }
     }
-
-    // If the caller expects Fortran order, convert. But since NSIM
-    // immediately does element-wise ops, C order is fine.
-    out
 }
 
 /// Compute zero-padded matrix and fill zero-padded boundaries with the adjacent non-zero rows and columns

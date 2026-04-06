@@ -3,6 +3,7 @@ use std::simd::f64x2;
 
 /// Bank of gammatone filters on each frame of a time domain signal to construct a spectrogram representation.
 /// This implementation is fixed to a 4th order filterbank.
+#[allow(dead_code)]
 pub struct GammatoneFilterbank<const NUM_BANDS: usize> {
     pub min_freq: f64,
 
@@ -28,6 +29,7 @@ pub struct GammatoneFilterbank<const NUM_BANDS: usize> {
     buf_b: Vec<f64>,
 }
 
+#[allow(dead_code)]
 impl<const NUM_BANDS: usize> GammatoneFilterbank<NUM_BANDS> {
     /// Creates a new gammatone filterbank with the desired number of frequency bands and the minimum frequency.
     pub fn new(min_freq: f64) -> Self {
@@ -164,6 +166,57 @@ impl<const NUM_BANDS: usize> GammatoneFilterbank<NUM_BANDS> {
         output
     }
 
+    /// Applies the filterbank and computes per-band RMS in a single pass,
+    /// assuming filter state is zero (fresh frame). Skips state load/writeback.
+    ///
+    /// Processes bands in pairs using `f64x2` portable SIMD. For each pair,
+    /// all 4 cascaded IIR filter stages are run sample-by-sample with both
+    /// bands packed into SIMD lanes, and sum-of-squares is accumulated
+    /// inline in the final stage. This gives ~2× throughput on the IIR
+    /// cascade (the dominant cost).
+    #[inline(always)]
+    pub fn apply_filter_rms_fresh(&self, input_signal: &[f64], rms_out: &mut [f64]) {
+        let sig_len = input_signal.len();
+        let inv_len = 1.0 / sig_len as f64;
+
+        // Process pairs of bands with SIMD
+        let num_pairs = NUM_BANDS / 2;
+        for pair in 0..num_pairs {
+            let b0 = pair * 2;
+            let b1 = b0 + 1;
+            Self::apply_filter_pair_rms_fresh(
+                &self.filter_coeff_a0,
+                &self.filter_coeff_a11,
+                &self.filter_coeff_a12,
+                &self.filter_coeff_a13,
+                &self.filter_coeff_a14,
+                &self.filter_coeff_a2,
+                &self.filter_coeff_b1,
+                &self.filter_coeff_b2,
+                &self.filter_coeff_gain,
+                b0, b1, input_signal, inv_len, rms_out,
+            );
+        }
+
+        // Handle odd trailing band with scalar path
+        if NUM_BANDS % 2 == 1 {
+            let band = NUM_BANDS - 1;
+            Self::apply_filter_single_rms_fresh(
+                &self.filter_coeff_a0,
+                &self.filter_coeff_a11,
+                &self.filter_coeff_a12,
+                &self.filter_coeff_a13,
+                &self.filter_coeff_a14,
+                &self.filter_coeff_a2,
+                &self.filter_coeff_b0,
+                &self.filter_coeff_b1,
+                &self.filter_coeff_b2,
+                &self.filter_coeff_gain,
+                band, input_signal, inv_len, rms_out,
+            );
+        }
+    }
+
     /// Applies the filterbank and computes per-band RMS in a single pass.
     ///
     /// Processes bands in pairs using `f64x2` portable SIMD. For each pair,
@@ -191,6 +244,94 @@ impl<const NUM_BANDS: usize> GammatoneFilterbank<NUM_BANDS> {
             self.ensure_buffers(sig_len);
             self.apply_filter_single_rms(band, input_signal, sig_len, inv_len, rms_out);
         }
+    }
+
+    /// Process a pair of bands with zero initial state, no writeback.
+    #[inline(always)]
+    fn apply_filter_pair_rms_fresh(
+        a0: &[f64], a11: &[f64], a12: &[f64], a13: &[f64], a14: &[f64],
+        a2: &[f64], b1: &[f64], b2: &[f64], gain: &[f64],
+        b0: usize, b1_idx: usize,
+        input_signal: &[f64], inv_len: f64, rms_out: &mut [f64],
+    ) {
+        let gi0 = 1.0 / gain[b0];
+        let gi1 = 1.0 / gain[b1_idx];
+
+        let s1_n0 = f64x2::from_array([a0[b0] * gi0, a0[b1_idx] * gi1]);
+        let s1_n1 = f64x2::from_array([a11[b0] * gi0, a11[b1_idx] * gi1]);
+        let s1_n2 = f64x2::from_array([a2[b0] * gi0, a2[b1_idx] * gi1]);
+        let ca0 = f64x2::from_array([a0[b0], a0[b1_idx]]);
+        let ca2 = f64x2::from_array([a2[b0], a2[b1_idx]]);
+        let s2_n1 = f64x2::from_array([a12[b0], a12[b1_idx]]);
+        let s3_n1 = f64x2::from_array([a13[b0], a13[b1_idx]]);
+        let s4_n1 = f64x2::from_array([a14[b0], a14[b1_idx]]);
+        let d1 = f64x2::from_array([b1[b0], b1[b1_idx]]);
+        let d2 = f64x2::from_array([b2[b0], b2[b1_idx]]);
+
+        // Zero initial state
+        let mut s1c0 = f64x2::splat(0.0);
+        let mut s1c1 = f64x2::splat(0.0);
+        let mut s2c0 = f64x2::splat(0.0);
+        let mut s2c1 = f64x2::splat(0.0);
+        let mut s3c0 = f64x2::splat(0.0);
+        let mut s3c1 = f64x2::splat(0.0);
+        let mut s4c0 = f64x2::splat(0.0);
+        let mut s4c1 = f64x2::splat(0.0);
+        let mut sum_sq = f64x2::splat(0.0);
+
+        for &s in input_signal {
+            let sv = f64x2::splat(s);
+            let f1 = s1_n0 * sv + s1c0;
+            s1c0 = s1_n1 * sv + s1c1 - d1 * f1;
+            s1c1 = s1_n2 * sv - d2 * f1;
+            let f2 = ca0 * f1 + s2c0;
+            s2c0 = s2_n1 * f1 + s2c1 - d1 * f2;
+            s2c1 = ca2 * f1 - d2 * f2;
+            let f3 = ca0 * f2 + s3c0;
+            s3c0 = s3_n1 * f2 + s3c1 - d1 * f3;
+            s3c1 = ca2 * f2 - d2 * f3;
+            let f4 = ca0 * f3 + s4c0;
+            s4c0 = s4_n1 * f3 + s4c1 - d1 * f4;
+            s4c1 = ca2 * f3 - d2 * f4;
+            sum_sq += f4 * f4;
+        }
+
+        // No state writeback needed
+        let sq = sum_sq.to_array();
+        rms_out[b0] = (sq[0] * inv_len).sqrt();
+        rms_out[b1_idx] = (sq[1] * inv_len).sqrt();
+    }
+
+    /// Scalar fallback for a single band with zero initial state.
+    #[inline(always)]
+    fn apply_filter_single_rms_fresh(
+        a0: &[f64], a11: &[f64], a12: &[f64], a13: &[f64], a14: &[f64],
+        a2: &[f64], b0_coeff: &[f64], b1: &[f64], b2: &[f64], gain: &[f64],
+        band: usize, input_signal: &[f64], inv_len: f64, rms_out: &mut [f64],
+    ) {
+        let gi = 1.0 / gain[band];
+        let coeffs = [
+            [a0[band] * gi, a11[band] * gi, a2[band] * gi],
+            [a0[band], a12[band], a2[band]],
+            [a0[band], a13[band], a2[band]],
+            [a0[band], a14[band], a2[band]],
+        ];
+        let denom = [b0_coeff[band], b1[band], b2[band]];
+
+        let mut state = [[0.0f64; 2]; 4];
+        let mut sq = 0.0f64;
+
+        for &s in input_signal {
+            let mut val = s;
+            for stage in 0..4 {
+                let filtered = coeffs[stage][0] * val + state[stage][0];
+                state[stage][0] = coeffs[stage][1] * val + state[stage][1] - denom[1] * filtered;
+                state[stage][1] = coeffs[stage][2] * val - denom[2] * filtered;
+                val = filtered;
+            }
+            sq += val * val;
+        }
+        rms_out[band] = (sq * inv_len).sqrt();
     }
 
     /// Process a pair of bands through all 4 cascaded IIR stages using f64x2.

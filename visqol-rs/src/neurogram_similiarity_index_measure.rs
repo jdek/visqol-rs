@@ -1,6 +1,7 @@
-use crate::convolution_2d::perform_valid_2d_conv_with_boundary;
+use crate::convolution_2d::{conv2d_3x3_reflected_into, perform_valid_2d_conv_with_boundary};
 use crate::patch_similarity_comparator::{PatchSimilarityComparator, PatchSimilarityResult};
-use ndarray::{arr2, Array1, Axis, Zip};
+use ndarray::{arr2, Array1, Array2, Axis, Zip};
+use std::sync::LazyLock;
 
 /// Provides a neurogram similarity index measure (NSIM) implementation for a
 /// patch similarity comparator. NSIM is a distance metric, adapted from the
@@ -31,6 +32,99 @@ const W: [[f64; 3]; 3] = [
     [0.0113033910173052, 0.0838251475442633, 0.0113033910173052],
 ];
 
+static WINDOW: LazyLock<Array2<f64>> = LazyLock::new(|| arr2(&W));
+
+/// Pre-allocated scratch buffers for NSIM computation to avoid per-call allocations.
+pub struct NsimScratch {
+    mu_ref: Array2<f64>,
+    mu_deg: Array2<f64>,
+    ref_neuro_sq: Array2<f64>,
+    deg_neuro_sq: Array2<f64>,
+    ref_neuro_deg: Array2<f64>,
+    conv_ref_sq: Array2<f64>,
+    conv_deg_sq: Array2<f64>,
+    conv_rd: Array2<f64>,
+}
+
+impl NsimScratch {
+    /// Create scratch buffers sized for patches of the given dimensions.
+    pub fn new(nrows: usize, ncols: usize) -> Self {
+        Self {
+            mu_ref: Array2::zeros((nrows, ncols)),
+            mu_deg: Array2::zeros((nrows, ncols)),
+            ref_neuro_sq: Array2::zeros((nrows, ncols)),
+            deg_neuro_sq: Array2::zeros((nrows, ncols)),
+            ref_neuro_deg: Array2::zeros((nrows, ncols)),
+            conv_ref_sq: Array2::zeros((nrows, ncols)),
+            conv_deg_sq: Array2::zeros((nrows, ncols)),
+            conv_rd: Array2::zeros((nrows, ncols)),
+        }
+    }
+}
+
+impl NeurogramSimiliarityIndexMeasure {
+    /// Scalar similarity using pre-allocated scratch buffers.
+    /// Avoids all heap allocations in the hot DP loop.
+    #[inline]
+    pub fn measure_similarity_scalar_scratched(
+        &self,
+        ref_patch: &Array2<f64>,
+        deg_patch: &Array2<f64>,
+        s: &mut NsimScratch,
+    ) -> f64 {
+        let window = &*WINDOW;
+
+        let c1 = (0.01 * self.intensity_range) * (0.01 * self.intensity_range);
+        let c3 = (0.03 * self.intensity_range) * (0.03 * self.intensity_range) / 2.0;
+
+        // Conv2d into scratch buffers
+        conv2d_3x3_reflected_into(window, ref_patch, &mut s.mu_ref);
+        conv2d_3x3_reflected_into(window, deg_patch, &mut s.mu_deg);
+
+        // Compute squared inputs into scratch
+        Zip::from(&mut s.ref_neuro_sq)
+            .and(ref_patch)
+            .for_each(|o, &r| *o = r * r);
+        Zip::from(&mut s.deg_neuro_sq)
+            .and(deg_patch)
+            .for_each(|o, &d| *o = d * d);
+        Zip::from(&mut s.ref_neuro_deg)
+            .and(ref_patch)
+            .and(deg_patch)
+            .for_each(|o, &r, &d| *o = r * d);
+
+        // Conv of squared/cross inputs
+        conv2d_3x3_reflected_into(window, &s.ref_neuro_sq, &mut s.conv_ref_sq);
+        conv2d_3x3_reflected_into(window, &s.deg_neuro_sq, &mut s.conv_deg_sq);
+        conv2d_3x3_reflected_into(window, &s.ref_neuro_deg, &mut s.conv_rd);
+
+        // Fused scalar accumulation: intensity * structure
+        let n = s.mu_ref.len() as f64;
+        let mut sum = 0.0f64;
+        Zip::from(&s.mu_ref)
+            .and(&s.mu_deg)
+            .and(&s.conv_ref_sq)
+            .and(&s.conv_deg_sq)
+            .and(&s.conv_rd)
+            .for_each(|&mr, &md, &crsq, &cdsq, &crd| {
+                let rms = mr * mr;
+                let dms = md * md;
+                let mrd = mr * md;
+                let srs = crsq - rms;
+                let sds = cdsq - dms;
+                let srd = crd - mrd;
+                let intensity = (2.0 * mrd + c1) / (rms + dms + c1);
+                let structure_denom = {
+                    let prod = srs * sds;
+                    if prod < 0.0 { c3 } else { prod.sqrt() + c3 }
+                };
+                let structure = (srd + c3) / structure_denom;
+                sum += intensity * structure;
+            });
+        sum / n
+    }
+}
+
 impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
     /// Computes the NSIM between `ref_patch` and `deg_patch` and returns the mean and standard deviation of each frequency band, the energy of the degraded patch and the similarity score.
     fn measure_patch_similarity(
@@ -38,7 +132,7 @@ impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
         ref_patch: &mut ndarray::Array2<f64>,
         deg_patch: &mut ndarray::Array2<f64>,
     ) -> PatchSimilarityResult {
-        let window = arr2(&W);
+        let window = &*WINDOW;
 
         let k = [0.01, 0.03];
         let c1 = (k[0] * self.intensity_range).powf(2.0);
@@ -111,6 +205,65 @@ impl PatchSimilarityComparator for NeurogramSimiliarityIndexMeasure {
             freq_band_deg_energy.to_vec(),
             mean_freq_band_means,
         )
+    }
+
+    fn measure_similarity_scalar(
+        &self,
+        ref_patch: &mut ndarray::Array2<f64>,
+        deg_patch: &mut ndarray::Array2<f64>,
+    ) -> f64 {
+        let window = &*WINDOW;
+
+        let k = [0.01, 0.03];
+        let c1 = (k[0] * self.intensity_range).powf(2.0);
+        let c3 = (k[1] * self.intensity_range).powf(2.0) / 2.0;
+
+        let mu_ref = perform_valid_2d_conv_with_boundary(window, ref_patch);
+        let mu_deg = perform_valid_2d_conv_with_boundary(window, deg_patch);
+
+        let ref_mu_squared = &mu_ref * &mu_ref;
+        let deg_mu_squared = &mu_deg * &mu_deg;
+        let mu_r_mu_d = &mu_ref * &mu_deg;
+
+        let mut ref_neuro_sq = ref_patch.mapv(|x| x * x);
+        let mut deg_neuro_sq = deg_patch.mapv(|x| x * x);
+
+        let conv2_ref_neuro_squared =
+            perform_valid_2d_conv_with_boundary(window, &mut ref_neuro_sq);
+        let sigma_ref_squared = &conv2_ref_neuro_squared - &ref_mu_squared;
+
+        let conv2_deg_neuro_squared =
+            perform_valid_2d_conv_with_boundary(window, &mut deg_neuro_sq);
+        let sigma_deg_squared = &conv2_deg_neuro_squared - &deg_mu_squared;
+
+        let mut ref_neuro_deg = Zip::from(&*ref_patch)
+            .and(&*deg_patch)
+            .map_collect(|&r, &d| r * d);
+        let conv2_ref_neuro_deg =
+            perform_valid_2d_conv_with_boundary(window, &mut ref_neuro_deg);
+
+        let sigma_r_d = &conv2_ref_neuro_deg - &mu_r_mu_d;
+
+        // Compute scalar mean of (intensity * structure) without materializing
+        // per-band statistics or allocating Vec results.
+        let n = mu_r_mu_d.len() as f64;
+        let mut sum = 0.0f64;
+        Zip::from(&mu_r_mu_d)
+            .and(&ref_mu_squared)
+            .and(&deg_mu_squared)
+            .and(&sigma_r_d)
+            .and(&sigma_ref_squared)
+            .and(&sigma_deg_squared)
+            .for_each(|&mrd, &rms, &dms, &srd, &srs, &sds| {
+                let intensity = (2.0 * mrd + c1) / (rms + dms + c1);
+                let structure_denom = {
+                    let prod = srs * sds;
+                    if prod < 0.0 { c3 } else { prod.sqrt() + c3 }
+                };
+                let structure = (srd + c3) / structure_denom;
+                sum += intensity * structure;
+            });
+        sum / n
     }
 }
 

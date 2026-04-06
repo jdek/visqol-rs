@@ -14,6 +14,7 @@ const NOISE_FLOOR_RELATIVE_TO_PEAK_DB: f64 = 45.0;
 const NOISE_FLOOR_ABSOLUTE_DB: f64 = -45.0;
 
 /// Returns a copy of `degraded` which has the same SPL as `reference`.
+#[allow(dead_code)]
 pub fn scale_to_match_sound_pressure_level(
     reference: &AudioSignal,
     degraded: &AudioSignal,
@@ -29,6 +30,17 @@ pub fn scale_to_match_sound_pressure_level(
             .expect("Failed to create AudioSignal from slice!"),
         degraded.sample_rate,
     )
+}
+
+/// Scales `degraded` in-place to match the SPL of `reference`.
+pub fn scale_to_match_sound_pressure_level_inplace(
+    reference: &AudioSignal,
+    degraded: &mut AudioSignal,
+) {
+    let ref_spl = calculate_sound_pressure_level(reference);
+    let deg_spl = calculate_sound_pressure_level(degraded);
+    let scale_factor = 10.0f64.powf((ref_spl - deg_spl) / 20.0);
+    degraded.data_matrix.mapv_inplace(|x| x * scale_factor);
 }
 
 /// Computes the sound pressure level of an audio signal in dB

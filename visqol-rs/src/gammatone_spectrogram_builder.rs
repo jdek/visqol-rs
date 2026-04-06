@@ -59,7 +59,9 @@ impl<const NUM_BANDS: usize> SpectrogramBuilder for GammatoneSpectrogramBuilder<
         }
 
         let cached = self.cached_coeffs.as_ref().unwrap();
-        self.filter_bank.set_filter_coefficients(&cached.filter_coeffs);
+        if need_recompute {
+            self.filter_bank.set_filter_coefficients(&cached.filter_coeffs);
+        }
 
         let hop_size = (window.size as f64 * window.overlap) as usize;
 
@@ -86,8 +88,7 @@ impl<const NUM_BANDS: usize> SpectrogramBuilder for GammatoneSpectrogramBuilder<
         {
             let frame = &signal_slice[frame_start..frame_start + window.size];
 
-            self.filter_bank.reset_filter_conditions();
-            self.filter_bank.apply_filter_rms(frame, &mut rms_col);
+            self.filter_bank.apply_filter_rms_fresh(frame, &mut rms_col);
 
             // Write RMS values directly into the output column
             for j in 0..NUM_BANDS {

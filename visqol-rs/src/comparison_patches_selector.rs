@@ -8,7 +8,7 @@ use crate::{
     analysis_window::AnalysisWindow,
     audio_signal::AudioSignal,
     audio_utils,
-    neurogram_similiarity_index_measure::NeurogramSimiliarityIndexMeasure,
+    neurogram_similiarity_index_measure::{NeurogramSimiliarityIndexMeasure, NsimScratch},
     patch_similarity_comparator::{PatchSimilarityComparator, PatchSimilarityResult},
     spectrogram_builder::SpectrogramBuilder,
     visqol_error::VisqolError,
@@ -89,6 +89,13 @@ impl ComparisonPatchesSelector {
             }
         }
 
+        // Pre-allocate scratch buffers for the NSIM scalar computation.
+        let mut scratch = if !ref_patches.is_empty() {
+            NsimScratch::new(ref_patches[0].nrows(), ref_patches[0].ncols())
+        } else {
+            NsimScratch::new(0, 0)
+        };
+
         // Attempt to get a good alignment with backtracking.
         for (index, ref_patch) in ref_patches.iter_mut().enumerate() {
             self.find_most_optimal_deg_patch(
@@ -100,6 +107,7 @@ impl ComparisonPatchesSelector {
                 ref_patch_indices,
                 index,
                 search_window,
+                &mut scratch,
             );
         }
         let mut max_similarity_score = f64::MIN;
@@ -135,11 +143,15 @@ impl ComparisonPatchesSelector {
             // This sets the reference and degraded patch start and end times.
             let mut ref_patch = ref_patches[patch_index as usize].clone();
 
-            let mut deg_patch = Self::build_degraded_patch(
-                spectrogram_data,
-                last_offset,
-                last_offset + ref_patch.ncols(),
-            );
+            let mut deg_patch = if last_offset >= global_lower && last_offset < global_upper {
+                deg_patches[last_offset].clone()
+            } else {
+                Self::build_degraded_patch(
+                    spectrogram_data,
+                    last_offset,
+                    last_offset + ref_patch.ncols(),
+                )
+            };
 
             best_deg_patches[patch_index as usize] = self
                 .sim_comparator
@@ -184,10 +196,9 @@ impl ComparisonPatchesSelector {
         ref_patch_indices: &[usize],
         patch_index: usize,
         search_window: i32,
+        scratch: &mut NsimScratch,
     ) {
         let ref_frame_index = ref_patch_indices[patch_index];
-
-        let mut sim_result;
 
         let mut slide_offset = ref_frame_index as i32 - search_window;
         while slide_offset <= ref_frame_index as i32 + search_window {
@@ -203,32 +214,19 @@ impl ComparisonPatchesSelector {
 
                 break;
             }
-            let deg_patch = &mut deg_patches[slide_offset as usize];
-            sim_result = self
+            let deg_patch = &deg_patches[slide_offset as usize];
+            let mut similarity = self
                 .sim_comparator
-                .measure_patch_similarity(ref_patch, deg_patch);
+                .measure_similarity_scalar_scratched(ref_patch, deg_patch, scratch);
             let mut past_slide_offset = -1;
             let mut highest_sim = f64::MIN;
 
             if patch_index > 0 {
-                // The lower_limit parameter tells us how far we should go
-                // back to look for a possible match for the previous patch index
-                // (patch_index - 1). The current value of lower_limit is used because the
-                // search space for the previous patch index  is
-                // (ref_patch_indices[patch_index - 1] - search_window,
-                // ref_patch_indices[patch_index - 1] + search_window).
                 let mut lower_limit: i32 =
                     ref_patch_indices[patch_index - 1] as i32 - search_window;
                 lower_limit = lower_limit.max(0);
-                // The back_offset parameter determines all the offsets that should be
-                // considered while calculating the highest cumulative similarity score
-                // achieved till patch_index - 1. Since two reference patches should
-                // not map to the exact same degraded patch, the initial value of
-                // back_offset is set to slide_offset - 1.
                 let mut back_offset = slide_offset - 1;
 
-                // The current for loop is used to find out the highest cumulative score
-                // achieved till the previous ref_patch_index.
                 while back_offset >= lower_limit {
                     if cumulative_similarity_dp[patch_index - 1][back_offset as usize] > highest_sim
                     {
@@ -239,22 +237,17 @@ impl ComparisonPatchesSelector {
                     back_offset -= 1;
                 }
 
-                sim_result.similarity += highest_sim;
-
-                // If the current reference patch experienced a packet loss, then the
-                // cumulative similarity score till the previous patch might be more and
-                // in that case no matching patch for the current reference patch is found
-                // in the degraded window.
+                similarity += highest_sim;
 
                 if cumulative_similarity_dp[patch_index - 1][slide_offset as usize]
-                    > sim_result.similarity
+                    > similarity
                 {
-                    sim_result.similarity =
+                    similarity =
                         cumulative_similarity_dp[patch_index - 1][slide_offset as usize];
                     past_slide_offset = slide_offset;
                 }
             }
-            cumulative_similarity_dp[patch_index][slide_offset as usize] = sim_result.similarity;
+            cumulative_similarity_dp[patch_index][slide_offset as usize] = similarity;
             backtrace[patch_index][slide_offset as usize] = past_slide_offset as usize;
             slide_offset += 1;
         }

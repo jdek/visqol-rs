@@ -65,4 +65,14 @@ pub trait PatchSimilarityComparator {
         ref_patch: &mut ImagePatch<f64>,
         deg_patch: &mut ImagePatch<f64>,
     ) -> PatchSimilarityResult;
+
+    /// Returns only the scalar similarity score, skipping per-band statistics.
+    #[allow(dead_code)]
+    fn measure_similarity_scalar(
+        &self,
+        ref_patch: &mut ImagePatch<f64>,
+        deg_patch: &mut ImagePatch<f64>,
+    ) -> f64 {
+        self.measure_patch_similarity(ref_patch, deg_patch).similarity
+    }
 }

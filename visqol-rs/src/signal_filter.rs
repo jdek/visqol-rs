@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 /// Applies an IIR filter in-place, writing results to `output`.
 ///
 /// `numerator_coeffs` and `denom_coeffs` are length-3 coefficient arrays.

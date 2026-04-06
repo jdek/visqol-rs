@@ -67,8 +67,8 @@ pub(crate) fn calculate_similarity_with_cache<const NUM_BANDS: usize>(
     search_window: usize,
 ) -> Result<SimilarityResult, Box<dyn Error>> {
     let ref_signal = &cache.signal;
-    let deg_signal_scaled =
-        audio_utils::scale_to_match_sound_pressure_level(ref_signal, deg_signal);
+
+    audio_utils::scale_to_match_sound_pressure_level_inplace(ref_signal, deg_signal);
 
     let mut spect_builder = GammatoneSpectrogramBuilder::<NUM_BANDS>::new(
         GammatoneFilterbank::new(constants::MINIMUM_FREQ),
@@ -77,7 +77,7 @@ pub(crate) fn calculate_similarity_with_cache<const NUM_BANDS: usize>(
     // Clone the cached raw reference spectrogram; the floor normalization
     // step will mutate it in a way that depends on the degraded signal.
     let mut ref_spectrogram = cache.raw_spectrogram.clone();
-    let mut deg_spectrogram = spect_builder.build(&deg_signal_scaled, &cache.window)?;
+    let mut deg_spectrogram = spect_builder.build(deg_signal, &cache.window)?;
 
     audio_utils::prepare_spectrograms_for_comparison(&mut ref_spectrogram, &mut deg_spectrogram);
 
@@ -96,7 +96,7 @@ pub(crate) fn calculate_similarity_with_cache<const NUM_BANDS: usize>(
     let realign_result = selector.finely_align_and_recreate_patches::<NUM_BANDS>(
         &mut sim_match_info,
         ref_signal,
-        &deg_signal_scaled,
+        deg_signal,
         &cache.window,
     )?;
     sim_match_info = realign_result;
@@ -138,8 +138,7 @@ pub fn calculate_similarity<const NUM_BANDS: usize>(
     search_window: usize,
 ) -> Result<SimilarityResult, Box<dyn Error>> {
     /////////////////// Stage 1: Preprocessing ///////////////////
-    let deg_signal_scaled =
-        audio_utils::scale_to_match_sound_pressure_level(ref_signal, deg_signal);
+    audio_utils::scale_to_match_sound_pressure_level_inplace(ref_signal, deg_signal);
     let mut spect_builder = GammatoneSpectrogramBuilder::<NUM_BANDS>::new(
         GammatoneFilterbank::new(constants::MINIMUM_FREQ),
     );
@@ -151,7 +150,7 @@ pub fn calculate_similarity<const NUM_BANDS: usize>(
     );
 
     let mut ref_spectrogram = spect_builder.build(ref_signal, &window)?;
-    let mut deg_spectrogram = spect_builder.build(&deg_signal_scaled, &window)?;
+    let mut deg_spectrogram = spect_builder.build(deg_signal, &window)?;
 
     audio_utils::prepare_spectrograms_for_comparison(&mut ref_spectrogram, &mut deg_spectrogram);
 
@@ -180,7 +179,7 @@ pub fn calculate_similarity<const NUM_BANDS: usize>(
     let realign_result = selector.finely_align_and_recreate_patches::<NUM_BANDS>(
         &mut sim_match_info,
         ref_signal,
-        &deg_signal_scaled,
+        deg_signal,
         &window,
     )?;
     sim_match_info = realign_result;
