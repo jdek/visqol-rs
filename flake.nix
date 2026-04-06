@@ -19,8 +19,7 @@
       visqol-c = { naersk, defaultMeta, makePkgconfigItem, symlinkJoin, ... }:
         let
           clib = naersk.buildPackage {
-            pname = "visqol-c";
-            version = "0.3.1";
+            name = "visqol-c-0.3.1";
             src = lib.fileset.toSource { root = src; inherit (config) fileset; };
             cargoBuildOptions = default: default ++ [ "--package" "visqol-c" ];
             copyLibs = true;
