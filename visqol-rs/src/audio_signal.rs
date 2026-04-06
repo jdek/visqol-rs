@@ -1,6 +1,7 @@
 use ndarray::Array1;
 
 /// represents a time domain audio signal.
+#[derive(Clone)]
 pub struct AudioSignal {
     /// The actual time domain samples
     pub data_matrix: Array1<f64>,

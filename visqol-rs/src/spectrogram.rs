@@ -2,6 +2,7 @@ use ndarray::{Array2, Axis};
 use ndarray_stats::QuantileExt;
 
 /// Contains the spectral representation of audio data
+#[derive(Clone)]
 pub struct Spectrogram {
     /// Spectrogram data, rows signify center frequencies, columns signify time
     pub data: Array2<f64>,

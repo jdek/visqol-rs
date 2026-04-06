@@ -4,11 +4,127 @@ use crate::{
     gammatone_filterbank::GammatoneFilterbank,
     gammatone_spectrogram_builder::GammatoneSpectrogramBuilder, patch_creator::PatchCreator,
     patch_similarity_comparator::PatchSimilarityResult, similarity_result::SimilarityResult,
-    similarity_to_quality_mapper::SimilarityToQualityMapper,
+    similarity_to_quality_mapper::SimilarityToQualityMapper, spectrogram::Spectrogram,
     spectrogram_builder::SpectrogramBuilder,
 };
 use ndarray::Array1;
 use std::error::Error;
+
+/// Cached intermediate results from processing a reference signal.
+/// Building the gammatone spectrogram is the most expensive step in the
+/// pipeline; caching it avoids redundant work when comparing many degraded
+/// files against the same reference.
+pub(crate) struct VisqolRef {
+    pub signal: AudioSignal,
+    pub raw_spectrogram: Spectrogram,
+    pub patch_indices: Vec<usize>,
+    pub window: AnalysisWindow,
+    pub frame_duration: f64,
+}
+
+/// Build the reference-only intermediates that can be reused across
+/// multiple degraded comparisons.
+pub(crate) fn prepare_reference<const NUM_BANDS: usize>(
+    ref_signal: &mut AudioSignal,
+    patch_creator: &dyn PatchCreator,
+) -> Result<VisqolRef, Box<dyn Error>> {
+    let mut spect_builder = GammatoneSpectrogramBuilder::<NUM_BANDS>::new(
+        GammatoneFilterbank::new(constants::MINIMUM_FREQ),
+    );
+
+    let window = AnalysisWindow::new(
+        ref_signal.sample_rate,
+        constants::OVERLAP,
+        constants::WINDOW_DURATION,
+    );
+
+    let ref_spectrogram = spect_builder.build(ref_signal, &window)?;
+
+    let ref_patch_indices =
+        patch_creator.create_ref_patch_indices(&ref_spectrogram.data, ref_signal, &window)?;
+
+    let frame_duration = calculate_frame_duration(
+        window.size as f64 * window.overlap,
+        ref_signal.sample_rate as usize,
+    );
+
+    Ok(VisqolRef {
+        signal: ref_signal.clone(),
+        raw_spectrogram: ref_spectrogram,
+        patch_indices: ref_patch_indices,
+        window,
+        frame_duration,
+    })
+}
+
+/// Run the similarity pipeline using a pre-built reference cache.
+pub(crate) fn calculate_similarity_with_cache<const NUM_BANDS: usize>(
+    cache: &VisqolRef,
+    deg_signal: &mut AudioSignal,
+    patch_creator: &dyn PatchCreator,
+    selector: &ComparisonPatchesSelector,
+    sim_to_qual_mapper: &dyn SimilarityToQualityMapper,
+    search_window: usize,
+) -> Result<SimilarityResult, Box<dyn Error>> {
+    let ref_signal = &cache.signal;
+    let deg_signal_scaled =
+        audio_utils::scale_to_match_sound_pressure_level(ref_signal, deg_signal);
+
+    let mut spect_builder = GammatoneSpectrogramBuilder::<NUM_BANDS>::new(
+        GammatoneFilterbank::new(constants::MINIMUM_FREQ),
+    );
+
+    // Clone the cached raw reference spectrogram; the floor normalization
+    // step will mutate it in a way that depends on the degraded signal.
+    let mut ref_spectrogram = cache.raw_spectrogram.clone();
+    let mut deg_spectrogram = spect_builder.build(&deg_signal_scaled, &cache.window)?;
+
+    audio_utils::prepare_spectrograms_for_comparison(&mut ref_spectrogram, &mut deg_spectrogram);
+
+    let mut ref_patch_indices = cache.patch_indices.clone();
+    let mut ref_patches =
+        patch_creator.create_patches_from_indices(&ref_spectrogram.data, &ref_patch_indices);
+
+    let mut sim_match_info = selector.find_most_optimal_deg_patches(
+        &mut ref_patches,
+        &mut ref_patch_indices,
+        &deg_spectrogram.data,
+        cache.frame_duration,
+        search_window as i32,
+    )?;
+
+    let realign_result = selector.finely_align_and_recreate_patches::<NUM_BANDS>(
+        &mut sim_match_info,
+        ref_signal,
+        &deg_signal_scaled,
+        &cache.window,
+    )?;
+    sim_match_info = realign_result;
+
+    let fvnsim = calc_per_patch_mean_freq_band_means(&sim_match_info);
+    let fstdnsim = calc_per_patch_mean_freq_band_std_devs(&sim_match_info, cache.frame_duration);
+    let fvdegenergy = calc_per_patch_mean_freq_band_degraded_energy(&sim_match_info);
+
+    let mut moslqo = predict_mos(
+        fvnsim
+            .as_slice()
+            .expect("failed to convert fvnsim to slice"),
+        sim_to_qual_mapper,
+    );
+
+    let vnsim = fvnsim.mean().expect("Failed to compute nsim mean");
+
+    moslqo = alter_for_similarity_extremes(vnsim, moslqo);
+    Ok(SimilarityResult::new(
+        moslqo,
+        vnsim,
+        fvnsim.to_vec(),
+        fstdnsim.to_vec(),
+        fvdegenergy.to_vec(),
+        ref_spectrogram.center_freq_bands,
+        sim_match_info,
+    ))
+}
 
 /// Perform a comparison on two audio signals. Their similarity is calculated
 /// and converted to a quality score using the given similarity to quality

@@ -19,6 +19,12 @@ use crate::{
     visqol_error::VisqolError,
 };
 
+/// Opaque handle to a prepared reference signal, for use with
+/// [`VisqolManager::run_with_reference`].
+pub struct VisqolRef {
+    inner: visqol::VisqolRef,
+}
+
 /// Configures and executes audio evaluation using ViSQOL.
 pub struct VisqolManager<const NUM_BANDS: usize> {
     search_window: usize,
@@ -86,6 +92,44 @@ impl<const NUM_BANDS: usize> VisqolManager<NUM_BANDS> {
             self.patch_creator.as_mut(),
             &self.patch_selector,
             self.sim_to_quality_mapper.as_mut(),
+            self.search_window,
+        )
+    }
+
+    /// Pre-processes a reference signal so that its spectrogram and patch
+    /// indices can be reused across many degraded comparisons.
+    pub fn prepare_reference(
+        &mut self,
+        ref_signal_path: &str,
+    ) -> Result<VisqolRef, Box<dyn Error>> {
+        let mut ref_signal = audio_utils::load_as_mono(ref_signal_path)?;
+        let inner = visqol::prepare_reference::<NUM_BANDS>(
+            &mut ref_signal,
+            self.patch_creator.as_ref(),
+        )?;
+        Ok(VisqolRef { inner })
+    }
+
+    /// Compare a degraded file against an already-prepared reference.
+    /// This skips re-loading and re-computing the reference spectrogram.
+    pub fn run_with_reference(
+        &mut self,
+        prepared: &VisqolRef,
+        deg_signal_path: &str,
+    ) -> Result<SimilarityResult, Box<dyn Error>> {
+        let deg_signal = audio_utils::load_as_mono(deg_signal_path)?;
+        Self::validate_input_audio(&prepared.inner.signal, &deg_signal)?;
+
+        let (mut deg_signal, _) =
+            alignment::globally_align(&prepared.inner.signal, &deg_signal)
+                .ok_or(VisqolError::FailedToAlignSignals)?;
+
+        visqol::calculate_similarity_with_cache::<NUM_BANDS>(
+            &prepared.inner,
+            &mut deg_signal,
+            self.patch_creator.as_ref(),
+            &self.patch_selector,
+            self.sim_to_quality_mapper.as_ref(),
             self.search_window,
         )
     }
