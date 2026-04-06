@@ -14,13 +14,32 @@
     ];
 
     packages = {
-      visqol-c = { naersk, defaultMeta, ... }:
-        naersk.buildPackage {
-          src = lib.fileset.toSource { root = src; inherit (config) fileset; };
-          cargoBuildOptions = default: default ++ [ "--package" "visqol-c" ];
-          copyLibs = true;
-          copyBins = false;
-          strictDeps = true;
+      visqol-c = { naersk, defaultMeta, makePkgconfigItem, symlinkJoin, ... }:
+        let
+          clib = naersk.buildPackage {
+            pname = "visqol-c";
+            version = "0.3.1";
+            src = lib.fileset.toSource { root = src; inherit (config) fileset; };
+            cargoBuildOptions = default: default ++ [ "--package" "visqol-c" ];
+            copyLibs = true;
+            copyBins = false;
+            strictDeps = true;
+            postInstall = ''
+              mkdir -p $out/include
+              find target -name visqol.h -path '*/out/visqol.h' -exec cp {} $out/include/ \;
+            '';
+          };
+          pc = makePkgconfigItem {
+            name = "visqol";
+            inherit (clib) version;
+            description = "C API for the ViSQOL perceptual audio quality metric";
+            libs = [ "-L${clib}/lib" "-lvisqol_c" ];
+            cflags = [ "-I${clib}/include" ];
+          };
+        in
+        symlinkJoin {
+          name = "visqol-c-${clib.version}";
+          paths = [ clib pc ];
           meta = defaultMeta;
         };
     };
