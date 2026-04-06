@@ -1,11 +1,4 @@
 /target
-Cargo.lock
-.DS_Store
 tarpaulin-report.html
-# Added by cargo
-#
-# already existing elements were commented out
-
-#/target
 .DS_Store
 .vscode/settings.json
