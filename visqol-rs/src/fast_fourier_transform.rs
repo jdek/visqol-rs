@@ -7,26 +7,20 @@ pub fn forward_1d_from_matrix(
     fft_manager: &mut FftManager,
     input_signal: &[f64],
 ) -> Vec<Complex64> {
-    let mut temp_time_buffer = input_signal.to_vec();
-
     let mut temp_freq_buffer = vec![Complex64::zero(); fft_manager.fft_size];
-    fft_manager.freq_from_time_domain(&mut temp_time_buffer, &mut temp_freq_buffer);
-
+    // Pass the input slice directly — manager zero-pads into its complex_buf.
+    fft_manager.freq_from_time_domain_slice(input_signal, &mut temp_freq_buffer);
     temp_freq_buffer
 }
 /// Performs a fast fourier transform on `input_signal` using `fft_manager` and the desired number of fft_points and returns the complex signal in the frequency domain.
 pub fn forward_1d_from_points(
     fft_manager: &mut FftManager,
     in_matrix: &[f64],
-    num_fft_points: usize,
+    _num_fft_points: usize,
 ) -> Vec<Complex64> {
-    // Build zero-padded signal directly into a single buffer (was 3 copies)
-    let mut signal = Vec::with_capacity(num_fft_points);
-    signal.extend_from_slice(in_matrix);
-    signal.resize(num_fft_points, 0.0);
-
     let mut temp_freq_buffer = vec![Complex64::zero(); fft_manager.fft_size];
-    fft_manager.freq_from_time_domain(&mut signal, &mut temp_freq_buffer);
+    // Manager zero-pads `in_matrix` into its complex_buf up to fft_size.
+    fft_manager.freq_from_time_domain_slice(in_matrix, &mut temp_freq_buffer);
     temp_freq_buffer
 }
 /// Performs an inverse fast fourier transform on `input_signal` using `fft_manager` and returns the real-valued signal in the time domain.

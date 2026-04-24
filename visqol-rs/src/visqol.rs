@@ -3,7 +3,8 @@ use crate::{
     comparison_patches_selector::ComparisonPatchesSelector, constants,
     gammatone_filterbank::GammatoneFilterbank,
     gammatone_spectrogram_builder::GammatoneSpectrogramBuilder, patch_creator::PatchCreator,
-    patch_similarity_comparator::PatchSimilarityResult, similarity_result::SimilarityResult,
+    patch_similarity_comparator::PatchSimilarityResult, perf_trace,
+    similarity_result::SimilarityResult,
     similarity_to_quality_mapper::SimilarityToQualityMapper, spectrogram::Spectrogram,
     spectrogram_builder::SpectrogramBuilder,
 };
@@ -141,8 +142,12 @@ pub fn calculate_similarity<const NUM_BANDS: usize>(
     sim_to_qual_mapper: &dyn SimilarityToQualityMapper,
     search_window: usize,
 ) -> Result<SimilarityResult, Box<dyn Error>> {
+    let _t_total = perf_trace::span("calculate_similarity_total");
     /////////////////// Stage 1: Preprocessing ///////////////////
-    audio_utils::scale_to_match_sound_pressure_level_inplace(ref_signal, deg_signal);
+    {
+        let _t = perf_trace::span("spl_match");
+        audio_utils::scale_to_match_sound_pressure_level_inplace(ref_signal, deg_signal);
+    }
     let mut spect_builder = GammatoneSpectrogramBuilder::<NUM_BANDS>::new(
         GammatoneFilterbank::new(constants::MINIMUM_FREQ),
     );
@@ -153,39 +158,61 @@ pub fn calculate_similarity<const NUM_BANDS: usize>(
         constants::WINDOW_DURATION,
     );
 
-    let mut ref_spectrogram = spect_builder.build(ref_signal, &window)?;
-    let mut deg_spectrogram = spect_builder.build(deg_signal, &window)?;
+    let mut ref_spectrogram = {
+        let _t = perf_trace::span("build_spectrogram_ref");
+        spect_builder.build(ref_signal, &window)?
+    };
+    let mut deg_spectrogram = {
+        let _t = perf_trace::span("build_spectrogram_deg");
+        spect_builder.build(deg_signal, &window)?
+    };
 
-    audio_utils::prepare_spectrograms_for_comparison(&mut ref_spectrogram, &mut deg_spectrogram);
+    {
+        let _t = perf_trace::span("prepare_spectrograms");
+        audio_utils::prepare_spectrograms_for_comparison(
+            &mut ref_spectrogram,
+            &mut deg_spectrogram,
+        );
+    }
 
     /////////////// Stage 2: Feature selection and similarity measure ////////////
-    let mut ref_patch_indices =
-        patch_creator.create_ref_patch_indices(&ref_spectrogram.data, ref_signal, &window)?;
+    let mut ref_patch_indices = {
+        let _t = perf_trace::span("create_ref_patch_indices");
+        patch_creator.create_ref_patch_indices(&ref_spectrogram.data, ref_signal, &window)?
+    };
 
     let frame_duration = calculate_frame_duration(
         window.size as f64 * window.overlap,
         ref_signal.sample_rate as usize,
     );
 
-    let mut ref_patches =
-        patch_creator.create_patches_from_indices(&ref_spectrogram.data, &ref_patch_indices);
+    let mut ref_patches = {
+        let _t = perf_trace::span("create_patches_from_indices");
+        patch_creator.create_patches_from_indices(&ref_spectrogram.data, &ref_patch_indices)
+    };
 
-    let mut sim_match_info = selector.find_most_optimal_deg_patches(
-        &mut ref_patches,
-        &mut ref_patch_indices,
-        &deg_spectrogram.data,
-        frame_duration,
-        search_window as i32,
-    )?;
+    let mut sim_match_info = {
+        let _t = perf_trace::span("find_most_optimal_deg_patches");
+        selector.find_most_optimal_deg_patches(
+            &mut ref_patches,
+            &mut ref_patch_indices,
+            &deg_spectrogram.data,
+            frame_duration,
+            search_window as i32,
+        )?
+    };
     // Realign the patches in time domain subsignals that start at the coarse
     // patch times.
 
-    let realign_result = selector.finely_align_and_recreate_patches::<NUM_BANDS>(
-        &mut sim_match_info,
-        ref_signal,
-        deg_signal,
-        &window,
-    )?;
+    let realign_result = {
+        let _t = perf_trace::span("finely_align_and_recreate_patches");
+        selector.finely_align_and_recreate_patches::<NUM_BANDS>(
+            &mut sim_match_info,
+            ref_signal,
+            deg_signal,
+            &window,
+        )?
+    };
     sim_match_info = realign_result;
 
     let fvnsim = calc_per_patch_mean_freq_band_means(&sim_match_info);

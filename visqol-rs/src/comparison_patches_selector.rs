@@ -10,6 +10,7 @@ use crate::{
     audio_utils,
     neurogram_similiarity_index_measure::{NeurogramSimiliarityIndexMeasure, NsimScratch},
     patch_similarity_comparator::PatchSimilarityResult,
+    perf_trace,
     spectrogram_builder::SpectrogramBuilder,
     visqol_error::VisqolError,
 };
@@ -98,6 +99,7 @@ impl ComparisonPatchesSelector {
         };
 
         // Attempt to get a good alignment with backtracking.
+        let _t_dp = perf_trace::span("dp_search");
         for (index, ref_patch) in ref_patches.iter_mut().enumerate() {
             // Precompute reference-only conv2d values once per ref_patch,
             // saving 2 out of 5 conv2d calls per DP search offset.
@@ -115,6 +117,7 @@ impl ComparisonPatchesSelector {
                 &mut scratch,
             );
         }
+        drop(_t_dp);
         let mut max_similarity_score = f64::MIN;
         // The patch index for the last reference patch.
         let last_index = num_patches - 1;
@@ -388,27 +391,43 @@ impl ComparisonPatchesSelector {
 
             // 2. For any pair, we want to shift the degraded signal to be maximally
             // aligned.
-            let (ref_audio_aligned, deg_audio_aligned, lag) =
+            let (ref_audio_aligned, deg_audio_aligned, lag) = {
+                let _t = perf_trace::span("realign.align_and_truncate");
                 align_and_truncate(&ref_patch_audio, &deg_patch_audio)
-                    .ok_or(VisqolError::FailedToAlignSignals)?;
+                    .ok_or(VisqolError::FailedToAlignSignals)?
+            };
 
             let new_ref_duration = ref_audio_aligned.get_duration();
             let new_deg_duration = deg_audio_aligned.get_duration();
             // 3. Compute a new spectrogram for the degraded audio.
-            let mut ref_spectrogram = spect_builder.build(&ref_audio_aligned, analysis_window)?;
-            let mut deg_spectrogram = spect_builder.build(&deg_audio_aligned, analysis_window)?;
+            let mut ref_spectrogram = {
+                let _t = perf_trace::span("realign.build_spectrogram");
+                spect_builder.build(&ref_audio_aligned, analysis_window)?
+            };
+            let mut deg_spectrogram = {
+                let _t = perf_trace::span("realign.build_spectrogram");
+                spect_builder.build(&deg_audio_aligned, analysis_window)?
+            };
             // 4. Recreate an aligned degraded patch from the new spectrogram.
 
-            audio_utils::prepare_spectrograms_for_comparison(
-                &mut ref_spectrogram,
-                &mut deg_spectrogram,
-            );
+            {
+                let _t = perf_trace::span("realign.prepare_spectrograms");
+                audio_utils::prepare_spectrograms_for_comparison(
+                    &mut ref_spectrogram,
+                    &mut deg_spectrogram,
+                );
+            }
             // 5. Update the similarity result with the new patch.
 
             scratch.ensure_size(ref_spectrogram.data.nrows(), ref_spectrogram.data.ncols());
-            let mut new_sim_result = self
-                .sim_comparator
-                .measure_patch_similarity_scratched(&ref_spectrogram.data, &deg_spectrogram.data, &mut scratch);
+            let mut new_sim_result = {
+                let _t = perf_trace::span("realign.measure_patch_similarity");
+                self.sim_comparator.measure_patch_similarity_scratched(
+                    &ref_spectrogram.data,
+                    &deg_spectrogram.data,
+                    &mut scratch,
+                )
+            };
             // Compare to the old result and take the max.
             if new_sim_result.similarity < result.similarity {
                 realigned_results[i] = result.clone();

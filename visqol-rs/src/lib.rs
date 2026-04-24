@@ -46,6 +46,7 @@ mod math_utils;
 mod neurogram_similiarity_index_measure;
 mod patch_creator;
 mod patch_similarity_comparator;
+pub mod perf_trace;
 mod rms_vad;
 mod signal_filter;
 pub mod similarity_result;

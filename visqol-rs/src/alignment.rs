@@ -1,5 +1,6 @@
 use crate::audio_signal::AudioSignal;
 use crate::envelope;
+use crate::perf_trace;
 use crate::xcorr;
 use ndarray::Array1;
 use ndarray::{concatenate, s, Axis};
@@ -55,10 +56,20 @@ pub fn globally_align(
     ref_signal: &AudioSignal,
     deg_signal: &AudioSignal,
 ) -> Option<(AudioSignal, f64)> {
-    let ref_env = envelope::calculate_upper_env(&ref_signal.data_matrix)?;
-    let deg_env = envelope::calculate_upper_env(&deg_signal.data_matrix)?;
+    let _t = perf_trace::span("globally_align");
+    let ref_env = {
+        let _t = perf_trace::span("globally_align.envelope");
+        envelope::calculate_upper_env(&ref_signal.data_matrix)?
+    };
+    let deg_env = {
+        let _t = perf_trace::span("globally_align.envelope");
+        envelope::calculate_upper_env(&deg_signal.data_matrix)?
+    };
 
-    let best_lag = xcorr::calculate_best_lag(ref_env.as_slice()?, deg_env.as_slice()?)?;
+    let best_lag = {
+        let _t = perf_trace::span("globally_align.xcorr");
+        xcorr::calculate_best_lag(ref_env.as_slice()?, deg_env.as_slice()?)?
+    };
 
     if best_lag == 0 || best_lag.abs() > (ref_signal.data_matrix.len() / 2) as i64 {
         let new_deg_signal =

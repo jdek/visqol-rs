@@ -77,5 +77,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     output_utils::write_results(&args, &results, &files_to_compare);
+    visqol_rs::perf_trace::dump();
     Ok(())
 }

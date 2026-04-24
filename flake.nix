@@ -16,7 +16,10 @@
       let
         cargoSrc = lib.fileset.toSource { root = src; inherit (config) fileset; };
         buildVisqolC =
-          pkgs:
+          {
+            pkgs,
+            tuneNative ? false,
+          }:
           let
             inherit (pkgs)
               makePkgconfigItem
@@ -31,6 +34,7 @@
               copyLibs = true;
               copyBins = false;
               strictDeps = true;
+              CARGO_BUILD_RUSTFLAGS = lib.optionalString tuneNative "-C target-cpu=native";
               postInstall = ''
                 mkdir -p $out/include
                 find target -name visqol.h -path '*/out/visqol.h' -exec cp {} $out/include/ \;
@@ -76,13 +80,15 @@
         ];
 
         packages = {
-          visqol-c = pkgs: buildVisqolC pkgs;
-          visqol-c-aarch64-linux-gnu = pkgs: buildVisqolC pkgs.pkgsCross.aarch64-multiplatform;
-          visqol-c-aarch64-linux-musl = pkgs: buildVisqolC pkgs.pkgsCross.aarch64-multiplatform-musl;
+          visqol-c = pkgs: buildVisqolC { inherit pkgs; tuneNative = true; };
+          visqol-c-aarch64-linux-gnu =
+            pkgs: buildVisqolC { pkgs = pkgs.pkgsCross.aarch64-multiplatform; };
+          visqol-c-aarch64-linux-musl =
+            pkgs: buildVisqolC { pkgs = pkgs.pkgsCross.aarch64-multiplatform-musl; };
         };
 
         overlays.default = final: _prev: {
-          visqol-c = buildVisqolC final;
+          visqol-c = buildVisqolC { pkgs = final; tuneNative = true; };
         };
       }
     );

@@ -1,6 +1,6 @@
-use crate::fast_fourier_transform;
 use crate::fft_manager::FftManager;
 use num::complex::Complex64;
+use num::Zero;
 
 /// Calculate the maximum delay between two signals.
 pub fn calculate_best_lag(signal_1: &[f64], signal_2: &[f64]) -> Option<i64> {
@@ -61,33 +61,58 @@ pub fn calculate_inverse_fft_pointwise_product(
     }
     let (_, exp) = frexp((signal_1.len() * 2 - 1) as f64);
     let fft_points = 2usize.pow(exp as u32);
-    let mut manager = FftManager::new(fft_points);
-    let point_wise_product =
-        calculate_fft_pointwise_product(signal_1, signal_2, &mut manager, fft_points);
-
-    fast_fourier_transform::inverse_1d_conj_sym(&mut manager, &point_wise_product)
+    FftManager::with_cached(fft_points, |manager| {
+        // Real → complex forward FFT on each input (inputs are real-valued
+        // and zero-padded to fft_points). The pointwise product H1 * conj(H2)
+        // is Hermitian-symmetric; an inverse C2R recovers the real-valued
+        // cross-correlation. Halves both forward and inverse FFT work
+        // compared to the previous full-complex round-trip.
+        let half = manager.half_spectrum_size();
+        let mut h1 = vec![Complex64::zero(); half];
+        let mut h2 = vec![Complex64::zero(); half];
+        manager.forward_r2c(signal_1, &mut h1);
+        manager.forward_r2c(signal_2, &mut h2);
+        // h1[i] *= conj(h2[i])
+        for (a, b) in h1.iter_mut().zip(h2.iter()) {
+            // (ar + i*ai) * (br - i*bi) = (ar*br + ai*bi) + i*(ai*br - ar*bi)
+            let ar = a.re;
+            let ai = a.im;
+            let br = b.re;
+            let bi = b.im;
+            a.re = ar * br + ai * bi;
+            a.im = ai * br - ar * bi;
+        }
+        let mut out = vec![0.0f64; manager.fft_size];
+        manager.inverse_c2r(&mut h1, &mut out);
+        out.truncate(manager.samples_per_channel);
+        out
+    })
 }
 
-/// Calculates the pointwise fft product of 2 signals
+/// Forward FFT both signals (R2C) and return their half-spectrum pointwise
+/// product `H1 * conj(H2)`. Output length is `manager.half_spectrum_size()`.
+/// Retained as a public helper for tests and any external integrations; the
+/// production xcorr path inlines this work.
 pub fn calculate_fft_pointwise_product(
     signal_1: &[f64],
     signal_2: &[f64],
     manager: &mut FftManager,
-    fft_points: usize,
+    _fft_points: usize,
 ) -> Vec<Complex64> {
-    let mut fft_signal_2 =
-        fast_fourier_transform::forward_1d_from_points(manager, signal_2, fft_points);
-    fft_signal_2
-        .iter_mut()
-        .for_each(|element| *element = element.conj());
-
-    let fft_signal_1 =
-        fast_fourier_transform::forward_1d_from_points(manager, signal_1, fft_points);
-    fft_signal_1
-        .iter()
-        .zip(fft_signal_2.iter())
-        .map(|(a, b)| a * b)
-        .collect()
+    let half = manager.half_spectrum_size();
+    let mut h1 = vec![Complex64::zero(); half];
+    let mut h2 = vec![Complex64::zero(); half];
+    manager.forward_r2c(signal_1, &mut h1);
+    manager.forward_r2c(signal_2, &mut h2);
+    for (a, b) in h1.iter_mut().zip(h2.iter()) {
+        let ar = a.re;
+        let ai = a.im;
+        let br = b.re;
+        let bi = b.im;
+        a.re = ar * br + ai * bi;
+        a.im = ai * br - ar * bi;
+    }
+    h1
 }
 
 ///
