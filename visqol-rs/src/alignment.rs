@@ -1,33 +1,74 @@
 use crate::audio_signal::AudioSignal;
+use crate::envelope;
 use crate::xcorr;
 use ndarray::Array1;
 use ndarray::{concatenate, s, Axis};
 
-/// Creates copy of `deg_signal` which is time-aligned to `ref_signal` using
-/// direct cross-correlation (without Hilbert envelope extraction).
-/// Returns a copy of the reference signal, a copy of the aligned degraded signal and the delay between the signals.
+/// Aligns and truncates so ref and deg share a length. Matches upstream
+/// C++/Python `Alignment::AlignAndTruncate`.
 pub fn align_and_truncate(
     ref_signal: &AudioSignal,
     deg_signal: &AudioSignal,
 ) -> Option<(AudioSignal, AudioSignal, f64)> {
-    let best_lag = xcorr::calculate_best_lag(
-        ref_signal.data_matrix.as_slice()?,
-        deg_signal.data_matrix.as_slice()?,
-    )?;
+    let (aligned_deg, lag_seconds) = globally_align(ref_signal, deg_signal)?;
+
+    let ref_len = ref_signal.data_matrix.len();
+    let deg_len = aligned_deg.data_matrix.len();
+
+    let (ref_data, deg_data) = if ref_len > deg_len {
+        let r = ref_signal
+            .data_matrix
+            .slice(s![..deg_len])
+            .to_owned();
+        (r, aligned_deg.data_matrix)
+    } else if ref_len < deg_len {
+        let lag_samples = (lag_seconds * ref_signal.sample_rate as f64) as i64;
+        if lag_samples > 0 {
+            let ls = lag_samples as usize;
+            let r = ref_signal.data_matrix.slice(s![ls..]).to_owned();
+            let d = aligned_deg.data_matrix
+                .slice(s![ls..ls + r.len()])
+                .to_owned();
+            (r, d)
+        } else {
+            let d = aligned_deg.data_matrix.slice(s![..ref_len]).to_owned();
+            (ref_signal.data_matrix.clone(), d)
+        }
+    } else {
+        (ref_signal.data_matrix.clone(), aligned_deg.data_matrix)
+    };
+
+    let min_len = ref_data.len().min(deg_data.len());
+    let ref_data = ref_data.slice(s![..min_len]).to_owned();
+    let deg_data = deg_data.slice(s![..min_len]).to_owned();
+
+    Some((
+        AudioSignal::from_owned(ref_data, ref_signal.sample_rate),
+        AudioSignal::from_owned(deg_data, deg_signal.sample_rate),
+        lag_seconds,
+    ))
+}
+
+/// Globally aligns the degraded signal to the reference using upper-envelope
+/// cross-correlation. Matches upstream C++/Python `Alignment::GloballyAlign`.
+pub fn globally_align(
+    ref_signal: &AudioSignal,
+    deg_signal: &AudioSignal,
+) -> Option<(AudioSignal, f64)> {
+    let ref_env = envelope::calculate_upper_env(&ref_signal.data_matrix)?;
+    let deg_env = envelope::calculate_upper_env(&deg_signal.data_matrix)?;
+
+    let best_lag = xcorr::calculate_best_lag(ref_env.as_slice()?, deg_env.as_slice()?)?;
 
     if best_lag == 0 || best_lag.abs() > (ref_signal.data_matrix.len() / 2) as i64 {
-        return Some((
-            AudioSignal::from_owned(ref_signal.data_matrix.clone(), ref_signal.sample_rate),
-            AudioSignal::from_owned(deg_signal.data_matrix.clone(), deg_signal.sample_rate),
-            0.0,
-        ));
+        let new_deg_signal =
+            AudioSignal::from_owned(deg_signal.data_matrix.clone(), deg_signal.sample_rate);
+        return Some((new_deg_signal, 0.0f64));
     }
 
-    let lag_f = best_lag as f64 / deg_signal.sample_rate as f64;
-
-    // Align degraded signal
     let new_deg_matrix = if best_lag < 0 {
-        deg_signal.data_matrix
+        deg_signal
+            .data_matrix
             .slice(s![best_lag.unsigned_abs() as usize..deg_signal.data_matrix.len()])
             .to_owned()
     } else {
@@ -36,65 +77,8 @@ pub fn align_and_truncate(
             .expect("Failed to zero pad degraded matrix!")
     };
 
-    // Truncate to same length
-    let (new_ref_matrix, new_deg_final) = match ref_signal.data_matrix.len().cmp(&new_deg_matrix.len()) {
-        std::cmp::Ordering::Less => {
-            let lag_samples = (lag_f * ref_signal.sample_rate as f64) as usize;
-            let r = ref_signal.data_matrix
-                .slice(s![lag_samples..ref_signal.len()])
-                .to_owned();
-            let d = new_deg_matrix
-                .slice(s![lag_samples..ref_signal.len()])
-                .to_owned();
-            (r, d)
-        }
-        std::cmp::Ordering::Greater => {
-            let deg_len = new_deg_matrix.len();
-            let r = ref_signal.data_matrix.slice(s![..deg_len]).to_owned();
-            (r, new_deg_matrix)
-        }
-        std::cmp::Ordering::Equal => {
-            (ref_signal.data_matrix.clone(), new_deg_matrix)
-        }
-    };
-
     Some((
-        AudioSignal::from_owned(new_ref_matrix, ref_signal.sample_rate),
-        AudioSignal::from_owned(new_deg_final, deg_signal.sample_rate),
-        lag_f,
+        AudioSignal::from_owned(new_deg_matrix, deg_signal.sample_rate),
+        best_lag as f64 / deg_signal.sample_rate as f64,
     ))
-}
-
-/// Aligns a degraded signal to the reference signal using direct
-/// cross-correlation. Returns the aligned degraded signal and the lag in seconds.
-pub fn globally_align(
-    ref_signal: &AudioSignal,
-    deg_signal: &AudioSignal,
-) -> Option<(AudioSignal, f64)> {
-    let best_lag = xcorr::calculate_best_lag(
-        ref_signal.data_matrix.as_slice()?,
-        deg_signal.data_matrix.as_slice()?,
-    )?;
-
-    if best_lag == 0 || best_lag.abs() > (ref_signal.data_matrix.len() / 2) as i64 {
-        let new_deg_signal =
-            AudioSignal::from_owned(deg_signal.data_matrix.clone(), deg_signal.sample_rate);
-        Some((new_deg_signal, 0.0f64))
-    } else {
-        let new_deg_matrix = if best_lag < 0 {
-            deg_signal.data_matrix
-                .slice(s![best_lag.unsigned_abs() as usize..deg_signal.data_matrix.len()])
-                .to_owned()
-        } else {
-            let zeros = Array1::<f64>::zeros(best_lag as usize);
-            concatenate(Axis(0), &[zeros.view(), deg_signal.data_matrix.view()])
-                .expect("Failed to zero pad degraded matrix!")
-        };
-
-        let new_deg_signal = AudioSignal::from_owned(new_deg_matrix, deg_signal.sample_rate);
-        Some((
-            new_deg_signal,
-            (best_lag as f64 / deg_signal.sample_rate as f64),
-        ))
-    }
 }

@@ -77,6 +77,8 @@ impl<const NUM_BANDS: usize> SpectrogramBuilder for GammatoneSpectrogramBuilder<
 
         // Pre-allocate a column buffer for RMS results
         let mut rms_col = vec![0.0f64; NUM_BANDS];
+        // Scratch buffer for the Hann-windowed frame
+        let mut windowed_frame = vec![0.0f64; window.size];
 
         let signal_slice = time_domain_signal
             .as_slice()
@@ -87,8 +89,17 @@ impl<const NUM_BANDS: usize> SpectrogramBuilder for GammatoneSpectrogramBuilder<
             .enumerate()
         {
             let frame = &signal_slice[frame_start..frame_start + window.size];
+            // Apply Hann window (matches upstream visqol C++/Python)
+            for ((w, &s), &h) in windowed_frame
+                .iter_mut()
+                .zip(frame.iter())
+                .zip(window.hann.iter())
+            {
+                *w = s * h;
+            }
 
-            self.filter_bank.apply_filter_rms_fresh(frame, &mut rms_col);
+            self.filter_bank
+                .apply_filter_rms_fresh(&windowed_frame, &mut rms_col);
 
             // Write RMS values directly into the output column
             for j in 0..NUM_BANDS {
@@ -140,8 +151,8 @@ mod tests {
             GammatoneSpectrogramBuilder::new(filter_bank);
         let spectrogram_ref = spectro_builder.build(&signal_ref, &window).unwrap();
 
-        // Check 1st element
-        assert_abs_diff_eq!(spectrogram_ref.data[(0, 0)], 9.44161e-05, epsilon = 0.00001);
+        // Check 1st element. Hann[0] = 0, so frame 0 is heavily attenuated.
+        assert_abs_diff_eq!(spectrogram_ref.data[(0, 0)], 1.363673e-5, epsilon = 1e-9);
         // Check dimensions
         assert_eq!(spectrogram_ref.data.ncols(), REF_SPECTRO_NUM_COLS);
     }

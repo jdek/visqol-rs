@@ -42,13 +42,13 @@ impl<const NUM_BANDS: usize> VisqolManager<NUM_BANDS> {
             Variant::Wideband {
                 use_unscaled_mos_mapping,
             } => {
-                patch_creator = Box::new(VadPatchCreator::new(PATCH_SIZE_AUDIO));
+                patch_creator = Box::new(VadPatchCreator::new(PATCH_SIZE_SPEECH));
                 sim_to_quality_mapper = Box::new(SpeechSimilarityToQualityMapper::new(
                     !use_unscaled_mos_mapping,
                 ));
             }
             Variant::Fullband { model } => {
-                patch_creator = Box::new(ImagePatchCreator::new(PATCH_SIZE_SPEECH));
+                patch_creator = Box::new(ImagePatchCreator::new(PATCH_SIZE_AUDIO));
                 sim_to_quality_mapper = Box::new(SvrSimilarityToQualityMapper::new(model));
             }
         }
@@ -176,6 +176,7 @@ mod tests {
                 "test_data/clean_speech/degraded_signal_16k.wav",
             )
             .unwrap();
-        assert_abs_diff_eq!(res.moslqo, 2.35, epsilon = 0.01);
+        // C++ reference: 3.37234 (visqol_cli --use_speech_mode --use_lattice_model=false)
+        assert_abs_diff_eq!(res.moslqo, 3.37234, epsilon = 0.001);
     }
 }

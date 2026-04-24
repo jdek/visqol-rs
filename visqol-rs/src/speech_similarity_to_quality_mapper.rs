@@ -18,10 +18,11 @@ impl SpeechSimilarityToQualityMapper {
 
 impl SimilarityToQualityMapper for SpeechSimilarityToQualityMapper {
     fn predict_quality(&self, similarity_vector: &[f64]) -> f64 {
-        const FIT_PARAMETER_A: f64 = 1.155_945_5;
-        const FIT_PARAMETER_B: f64 = 4.685_115_3;
-        const FIT_PARAMETER_X0: f64 = 0.765_523_2;
-        const FIT_SCALE: f64 = 1.2031409;
+        // Constants match upstream visqol C++ (speech_similarity_to_quality_mapper.cc).
+        const FIT_PARAMETER_A: f64 = -262.847_869;
+        const FIT_PARAMETER_B: f64 = 0.015_430_252_5;
+        const FIT_PARAMETER_X0: f64 = -361.063_949;
+        const FIT_SCALE: f64 = 1.245_063;
 
         let nsim_mean = similarity_vector.iter().sum::<f64>() / (similarity_vector.len() as f64);
         let mos = math_utils::exponential_from_fit(
