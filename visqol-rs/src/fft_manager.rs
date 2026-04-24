@@ -38,6 +38,12 @@ pub struct FftManager {
     real_buf: Vec<f64>,
     /// Reusable complex scratch for the realfft engine.
     real_scratch: Vec<Complex64>,
+    /// Reusable half-spectrum scratch buffers for callers that need to hold
+    /// two spectra simultaneously (e.g. xcorr's `H1 · conj(H2)` product).
+    spec_a: Vec<Complex64>,
+    spec_b: Vec<Complex64>,
+    /// Reusable real time-domain output buffer (size = fft_size).
+    time_out: Vec<f64>,
     /// Cached realfft plans. Plans hold internal mutable scratch, but `process_*_with_scratch`
     /// uses the caller-provided scratch.
     r2c: Option<Arc<dyn RealToComplex<f64>>>,
@@ -57,9 +63,66 @@ impl FftManager {
             scratch_buf: Vec::new(),
             real_buf: Vec::new(),
             real_scratch: Vec::new(),
+            spec_a: Vec::new(),
+            spec_b: Vec::new(),
+            time_out: Vec::new(),
             r2c: None,
             c2r: None,
         }
+    }
+
+    /// Run an FFT-based pointwise cross-correlation in-place against this
+    /// manager's reusable scratch. The closure receives the
+    /// `samples_per_channel`-length real result; the underlying buffers
+    /// (`spec_a`, `spec_b`, `time_out`) are retained for reuse on the next
+    /// call. Eliminates 3 large per-call Vec allocations on the xcorr hot
+    /// path (envelope, alignment, finely_align).
+    pub fn xcorr_inverse_pointwise<R>(
+        &mut self,
+        signal_1: &[f64],
+        signal_2: &[f64],
+        f: impl FnOnce(&[f64]) -> R,
+    ) -> R {
+        let half = self.half_spectrum_size();
+        let n = self.fft_size;
+        if self.spec_a.len() < half {
+            self.spec_a.resize(half, Complex64::zero());
+        }
+        if self.spec_b.len() < half {
+            self.spec_b.resize(half, Complex64::zero());
+        }
+        if self.time_out.len() < n {
+            self.time_out.resize(n, 0.0);
+        }
+
+        // Forward R2C of both signals into spec_a / spec_b.
+        // Take the buffers temporarily so we can borrow `self` mutably for r2c.
+        let mut spec_a = std::mem::take(&mut self.spec_a);
+        let mut spec_b = std::mem::take(&mut self.spec_b);
+        self.forward_r2c(signal_1, &mut spec_a[..half]);
+        self.forward_r2c(signal_2, &mut spec_b[..half]);
+
+        // spec_a[i] = spec_a[i] * conj(spec_b[i])
+        // (ar + i*ai) * (br - i*bi) = (ar*br + ai*bi) + i*(ai*br - ar*bi)
+        for (a, b) in spec_a[..half].iter_mut().zip(spec_b[..half].iter()) {
+            let ar = a.re;
+            let ai = a.im;
+            let br = b.re;
+            let bi = b.im;
+            a.re = ar * br + ai * bi;
+            a.im = ai * br - ar * bi;
+        }
+
+        // Inverse C2R into time_out.
+        let mut time_out = std::mem::take(&mut self.time_out);
+        self.inverse_c2r(&mut spec_a[..half], &mut time_out[..n]);
+        let result = f(&time_out[..self.samples_per_channel]);
+
+        // Return the buffers for reuse next call.
+        self.spec_a = spec_a;
+        self.spec_b = spec_b;
+        self.time_out = time_out;
+        result
     }
 
     /// Returns the size of the half-spectrum produced by `forward_r2c` /

@@ -4,43 +4,43 @@ use num::Zero;
 
 /// Calculate the maximum delay between two signals.
 pub fn calculate_best_lag(signal_1: &[f64], signal_2: &[f64]) -> Option<i64> {
-    let max_lag = ((signal_1.len().max(signal_2.len())) - 1) as i64;
+    let biggest = signal_1.len().max(signal_2.len());
+    let max_lag = (biggest - 1) as i64;
+    let (_, exp) = frexp((biggest * 2 - 1) as f64);
+    let fft_points = 2usize.pow(exp as u32);
 
+    // Owned copies so the inputs can be zero-padded inside the manager call.
     let mut sig1 = signal_1.to_vec();
     let mut sig2 = signal_2.to_vec();
-    let point_wise_fft_vec =
-        calculate_inverse_fft_pointwise_product(&mut sig1, &mut sig2);
+    sig1.resize(biggest, 0.0);
+    sig2.resize(biggest, 0.0);
 
-    // Find best correlation directly without rearranging.
-    // The correlation output is laid out as:
-    //   [0..max_lag+1]  = positive lags (indices 0..max_lag map to lags 0..max_lag)
-    //   [len-max_lag..] = negative lags (index len-k maps to lag -k)
-    //
-    // We search both regions and track the best absolute correlation.
-    let n = point_wise_fft_vec.len();
-    let neg_start = n - max_lag as usize;
-    let mut best_abs = f64::MIN;
-    let mut best_lag_result: i64 = 0;
-
-    // Negative lags region
-    for i in neg_start..n {
-        let abs_val = point_wise_fft_vec[i].abs();
-        if abs_val > best_abs {
-            best_abs = abs_val;
-            best_lag_result = i as i64 - n as i64; // negative
-        }
-    }
-
-    // Positive lags region
-    for i in 0..=(max_lag as usize) {
-        let abs_val = point_wise_fft_vec[i].abs();
-        if abs_val > best_abs {
-            best_abs = abs_val;
-            best_lag_result = i as i64; // positive
-        }
-    }
-
-    Some(best_lag_result)
+    Some(FftManager::with_cached(fft_points, |manager| {
+        manager.xcorr_inverse_pointwise(&sig1, &sig2, |corr| {
+            // Correlation output layout:
+            //   [0..max_lag+1]  = positive lags (index k → lag k)
+            //   [n-max_lag..n]  = negative lags (index n-k → lag -k)
+            let n = corr.len();
+            let neg_start = n - max_lag as usize;
+            let mut best_abs = f64::MIN;
+            let mut best_lag_result: i64 = 0;
+            for (i, &v) in corr[neg_start..n].iter().enumerate() {
+                let abs_val = v.abs();
+                if abs_val > best_abs {
+                    best_abs = abs_val;
+                    best_lag_result = (neg_start + i) as i64 - n as i64;
+                }
+            }
+            for (i, &v) in corr[..=max_lag as usize].iter().enumerate() {
+                let abs_val = v.abs();
+                if abs_val > best_abs {
+                    best_abs = abs_val;
+                    best_lag_result = i as i64;
+                }
+            }
+            best_lag_result
+        })
+    }))
 }
 
 /// Calculates the pointwise inverse fft product of 2 signals
@@ -48,44 +48,13 @@ pub fn calculate_inverse_fft_pointwise_product(
     signal_1: &mut Vec<f64>,
     signal_2: &mut Vec<f64>,
 ) -> Vec<f64> {
-    let biggest_length = signal_1.len().max(signal_2.len());
-
-    match &signal_1.len().cmp(&signal_2.len()) {
-        std::cmp::Ordering::Less => {
-            signal_1.resize(biggest_length, 0.0);
-        }
-        std::cmp::Ordering::Greater => {
-            signal_2.resize(biggest_length, 0.0);
-        }
-        _ => {}
-    }
-    let (_, exp) = frexp((signal_1.len() * 2 - 1) as f64);
+    let biggest = signal_1.len().max(signal_2.len());
+    signal_1.resize(biggest, 0.0);
+    signal_2.resize(biggest, 0.0);
+    let (_, exp) = frexp((biggest * 2 - 1) as f64);
     let fft_points = 2usize.pow(exp as u32);
     FftManager::with_cached(fft_points, |manager| {
-        // Real → complex forward FFT on each input (inputs are real-valued
-        // and zero-padded to fft_points). The pointwise product H1 * conj(H2)
-        // is Hermitian-symmetric; an inverse C2R recovers the real-valued
-        // cross-correlation. Halves both forward and inverse FFT work
-        // compared to the previous full-complex round-trip.
-        let half = manager.half_spectrum_size();
-        let mut h1 = vec![Complex64::zero(); half];
-        let mut h2 = vec![Complex64::zero(); half];
-        manager.forward_r2c(signal_1, &mut h1);
-        manager.forward_r2c(signal_2, &mut h2);
-        // h1[i] *= conj(h2[i])
-        for (a, b) in h1.iter_mut().zip(h2.iter()) {
-            // (ar + i*ai) * (br - i*bi) = (ar*br + ai*bi) + i*(ai*br - ar*bi)
-            let ar = a.re;
-            let ai = a.im;
-            let br = b.re;
-            let bi = b.im;
-            a.re = ar * br + ai * bi;
-            a.im = ai * br - ar * bi;
-        }
-        let mut out = vec![0.0f64; manager.fft_size];
-        manager.inverse_c2r(&mut h1, &mut out);
-        out.truncate(manager.samples_per_channel);
-        out
+        manager.xcorr_inverse_pointwise(signal_1, signal_2, |corr| corr.to_vec())
     })
 }
 
